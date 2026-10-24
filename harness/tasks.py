@@ -1,20 +1,21 @@
-"""Demo tasks. Replace these with your own.
+"""The tasks: seeded train-booking trips.
 
-Every task is built from a seed, so the same (task_id, seed) always gives the
-same starting files, hidden checks and reference solution. Most tasks here
-ignore the seed; `bulk_discount` uses it to generate a different variant each
-time, which is a cheap way to get many tasks out of one design.
+Every task is built from a seed, so the same (task_id, seed) always gives the same
+timetable, trip request and reference solution. The generator first plants one trip
+that meets every rule (this becomes the reference solution), then adds distractor
+trains that each break one rule. The verifier checks the rules, not the planted trip,
+so any valid set of bookings scores.
 """
+import math
 import random
-import textwrap
 from dataclasses import dataclass
 
-
-@dataclass
-class Case:
-    group: str      # "target": fails before the fix.  "regression": must keep passing.
-    code: str       # runs inside the sandbox and must set a variable called `result`
-    expect: object  # compared in the harness only; never sent to the sandbox
+CITIES = ["Mumbai", "Pune", "Nashik", "Surat", "Vadodara", "Ahmedabad", "Nagpur", "Indore",
+          "Bhopal", "Jaipur", "Delhi", "Agra", "Lucknow", "Hyderabad", "Bengaluru", "Chennai"]
+NAMES = ["Jaiv", "Shrey", "Sahil", "Kabir", "Priya", "Arjun", "Tanisha", "Vikram", "Isha", "Rohan"]
+CLASSES = {"SL": 1.6, "3A": 4.0, "2A": 5.8}   # class -> rupees per minute of travel, roughly
+CANCEL_FEE = 0.2                               # share of the price kept when a booking is cancelled
+MIN_CONNECTION = 30                            # minutes needed between trains at a change
 
 
 @dataclass
@@ -23,186 +24,101 @@ class TaskInstance:
     title: str
     difficulty: str
     instructions: str
-    files: dict      # starting files the agent can see
-    cases: list      # hidden checks (list of Case)
-    reference: dict  # files that solve the task; used by the oracle baseline
+    world: dict      # timetable, travellers and fees; a copy is sent to the sandbox
+    request: dict    # the trip rules; the verifier checks the bookings against these
+    reference: list  # (tool, args) actions that solve the task; used by the oracle
 
 
-def _case(group, code, expect):
-    return Case(group, textwrap.dedent(code).strip(), expect)
+def hhmm(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-# ---------------------------------------------------------------- slugify
-def slugify_task(seed):
+def make_train(rng, number, origin, destination, depart, duration, classes, seats=None):
+    """One train: a single leg from origin to destination. `seats` fixes chosen seat counts."""
+    fares = {}
+    for name in CLASSES:                          # keep a fixed class order: SL, 3A, 2A
+        if name in classes:
+            price = 5 * round(duration * CLASSES[name] * rng.uniform(0.9, 1.1) / 5)
+            fares[name] = {"price": price, "seats": rng.randint(4, 30)}
+    for name, count in (seats or {}).items():
+        fares[name]["seats"] = count
+    return {"number": number, "origin": origin, "destination": destination,
+            "depart": depart, "arrive": depart + duration, "classes": fares}
+
+
+def add_noise(rng, trains, numbers, stations, avoid, count):
+    """Trains on other routes, so the timetable holds more than the answer."""
+    while count:
+        origin, destination = rng.sample(stations, 2)
+        if (origin, destination) in avoid:
+            continue
+        classes = rng.sample(list(CLASSES), rng.randint(2, 3))
+        train = make_train(rng, next(numbers), origin, destination, rng.randrange(300, 1020, 5),
+                           rng.randrange(90, 360, 5), classes)
+        trains[train["number"]] = train
+        count -= 1
+
+
+def describe(request, cancel_fee):
+    """The trip request in plain words: the first observation the agent gets."""
+    return (f"Book train tickets for this trip.\n"
+            f"Travellers: {', '.join(request['travellers'])} (all travel together on the same trains).\n"
+            f"From: {request['origin']}   To: {request['destination']}\n"
+            f"Arrive by: {hhmm(request['deadline'])} at the latest. All trains run on the same day.\n"
+            f"Class: {request['travel_class']} on every train.\n"
+            f"Budget: Rs {request['budget']} in total for all travellers, including any cancellation fees "
+            f"(cancelling a booking costs {round(cancel_fee * 100)}% of its price).\n"
+            f"If you change trains, the next train must leave from the same station at least "
+            f"{request['min_connection']} minutes after the previous one arrives.\n"
+            f"Every traveller needs a seat on every train of the trip. Leave no extra bookings.\n"
+            f"Current bookings: none.\n"
+            f"Use the tools to search trains, check seats and book. When the bookings are done, call `finish`.")
+
+
+# ---------------------------------------------------------- direct_easy
+def direct_task(seed):
+    rng = random.Random(f"direct_easy:{seed}")
+    stations = rng.sample(CITIES, 6)
+    origin, destination = stations[0], stations[1]
+    travel_class = rng.choice(list(CLASSES))
+    traveller = rng.choice(NAMES)
+    numbers = iter(str(n) for n in rng.sample(range(11001, 22999), 20))
+
+    # the planted trip: one direct train that meets every rule
+    good = make_train(rng, next(numbers), origin, destination, rng.randrange(360, 720, 5),
+                      rng.randrange(150, 360, 5), list(CLASSES), seats={travel_class: rng.randint(2, 9)})
+    deadline = 30 * math.ceil((good["arrive"] + 20) / 30)
+    price = good["classes"][travel_class]["price"]
+    budget = 50 * math.ceil(price * rng.uniform(1.15, 1.4) / 50)
+
+    # distractors on the same route, each breaking exactly one rule
+    duration = max(120, good["arrive"] - good["depart"] - rng.randrange(0, 60, 5))
+    late = make_train(rng, next(numbers), origin, destination,                # arrives too late
+                      deadline - duration + rng.randrange(30, 120, 5), duration, list(CLASSES))
+    depart = max(300, good["depart"] - rng.randrange(30, 180, 5))
+    wrong = make_train(rng, next(numbers), origin, destination, depart,       # lacks the required class
+                       min(rng.randrange(150, 360, 5), deadline - 10 - depart),
+                       [c for c in CLASSES if c != travel_class])
+    trains = {t["number"]: t for t in (good, late, wrong)}
+    add_noise(rng, trains, numbers, stations, avoid={(origin, destination)}, count=8)
+
+    request = {"travellers": [traveller], "origin": origin, "destination": destination,
+               "deadline": deadline, "min_connection": MIN_CONNECTION,
+               "travel_class": travel_class, "budget": budget}
+    world = {"stations": sorted(stations), "trains": trains, "travellers": [traveller],
+             "cancel_fee": CANCEL_FEE, "bookings": []}
     return TaskInstance(
-        task_id="slugify", title="Fix slugify", difficulty="easy",
-        instructions=("`textutils.slugify` should turn a title into a URL slug: lowercase, "
-                      "punctuation removed, any run of spaces or dashes collapsed into a single "
-                      "dash, and no leading or trailing dash. Fix it."),
-        files={"textutils.py": 'def slugify(text):\n    """Turn a title into a URL slug."""\n'
-                               '    return text.lower().replace(" ", "-")\n'},
-        cases=[
-            _case("target", 'from textutils import slugify\nresult = slugify("Hello, World!")', "hello-world"),
-            _case("target", 'from textutils import slugify\nresult = slugify("  Multiple   spaces  ")', "multiple-spaces"),
-            _case("target", 'from textutils import slugify\nresult = slugify("a--b")', "a-b"),
-            _case("target", 'from textutils import slugify\nresult = slugify("C++ rocks")', "c-rocks"),
-            _case("target", 'from textutils import slugify\nresult = slugify("---Already---dashed---")', "already-dashed"),
-            _case("regression", 'from textutils import slugify\nresult = slugify("simple")', "simple"),
-            _case("regression", 'from textutils import slugify\nresult = slugify("two words")', "two-words"),
-        ],
-        reference={"textutils.py": 'import re\n\n\ndef slugify(text):\n'
-                                   '    text = re.sub(r"[^a-z0-9]+", "-", text.lower())\n'
-                                   '    return text.strip("-")\n'},
-    )
-
-
-# --------------------------------------------------------- parse_duration
-def duration_task(seed):
-    invalid = ('from durations import parse_duration\ntry:\n    parse_duration("{}")\n'
-               '    result = "no error"\nexcept ValueError:\n    result = "ValueError"')
-    return TaskInstance(
-        task_id="parse_duration", title="Parse combined durations", difficulty="easy",
-        instructions=("`durations.parse_duration` should also accept combined values such as '1h30m' "
-                      "or '1h1m1s' and return the total number of seconds as an int. Invalid input "
-                      "(an empty string, an unknown unit, or a number with no unit) must raise ValueError."),
-        files={"durations.py": 'UNITS = {"s": 1, "m": 60, "h": 3600}\n\n\ndef parse_duration(text):\n'
-                               '    """Convert a duration like \'90s\', \'5m\' or \'2h\' to seconds."""\n'
-                               '    return int(text[:-1]) * UNITS[text[-1]]\n'},
-        cases=[
-            _case("target", 'from durations import parse_duration\nresult = parse_duration("1h30m")', 5400),
-            _case("target", 'from durations import parse_duration\nresult = parse_duration("1h1m1s")', 3661),
-            _case("target", invalid.format("5x"), "ValueError"),
-            _case("target", invalid.format("10d"), "ValueError"),
-            _case("target", invalid.format("30"), "ValueError"),
-            _case("regression", 'from durations import parse_duration\nresult = parse_duration("45s")', 45),
-            _case("regression", 'from durations import parse_duration\nresult = parse_duration("10m")', 600),
-            _case("regression", 'from durations import parse_duration\nresult = parse_duration("2h")', 7200),
-            _case("regression", invalid.format(""), "ValueError"),
-        ],
-        reference={"durations.py": 'import re\n\nUNITS = {"s": 1, "m": 60, "h": 3600}\n'
-                                   '_PART = re.compile(r"(\\d+)([smh])")\n\n\ndef parse_duration(text):\n'
-                                   '    if not text or not re.fullmatch(r"(?:\\d+[smh])+", text):\n'
-                                   '        raise ValueError(f"invalid duration: {text!r}")\n'
-                                   '    return sum(int(n) * UNITS[u] for n, u in _PART.findall(text))\n'},
-    )
-
-
-# -------------------------------------------------------- merge_intervals
-def intervals_task(seed):
-    def call(data):
-        return f"from intervals import merge_intervals\nresult = merge_intervals({data})"
-    return TaskInstance(
-        task_id="merge_intervals", title="Merge intervals", difficulty="medium",
-        instructions=("`intervals.merge_intervals` should merge overlapping [start, end] intervals and "
-                      "return them as a list of [start, end] lists sorted by start. Intervals that touch, "
-                      "such as [1, 2] and [2, 3], count as overlapping. The input may be unsorted."),
-        files={"intervals.py": 'def merge_intervals(intervals):\n'
-                               '    """Merge overlapping [start, end] intervals and return them sorted."""\n'
-                               '    merged = []\n    for start, end in intervals:\n'
-                               '        if merged and start < merged[-1][1]:\n'
-                               '            merged[-1][1] = max(merged[-1][1], end)\n'
-                               '        else:\n            merged.append([start, end])\n    return merged\n'},
-        cases=[
-            _case("target", call([[8, 10], [1, 3], [2, 6], [15, 18]]), [[1, 6], [8, 10], [15, 18]]),
-            _case("target", call([[1, 2], [2, 3]]), [[1, 3]]),
-            _case("target", call([[5, 6], [1, 5], [7, 8]]), [[1, 6], [7, 8]]),
-            _case("target", call([[2, 3], [1, 10]]), [[1, 10]]),
-            _case("regression", call([[1, 3], [5, 6]]), [[1, 3], [5, 6]]),
-            _case("regression", call([[1, 10], [2, 3]]), [[1, 10]]),
-            _case("regression", call([]), []),
-        ],
-        reference={"intervals.py": 'def merge_intervals(intervals):\n    merged = []\n'
-                                   '    for start, end in sorted(intervals):\n'
-                                   '        if merged and start <= merged[-1][1]:\n'
-                                   '            merged[-1][1] = max(merged[-1][1], end)\n'
-                                   '        else:\n            merged.append([start, end])\n    return merged\n'},
-    )
-
-
-# -------------------------------------------------------------- lru_cache
-def lru_task(seed):
-    head = "from cache import LRUCache\n"
-    return TaskInstance(
-        task_id="lru_cache", title="Fix the LRU cache", difficulty="medium",
-        instructions=("`cache.LRUCache` should evict the least recently used key when it is full. Both "
-                      "`get` and `put` must mark a key as the most recently used. `get` returns -1 for a "
-                      "missing key."),
-        files={"cache.py": 'class LRUCache:\n    """A fixed-size cache that evicts the least recently used key."""\n\n'
-                           '    def __init__(self, capacity):\n        self.capacity = capacity\n'
-                           '        self.data = {}  # insertion order is age order\n\n'
-                           '    def get(self, key):\n        return self.data.get(key, -1)\n\n'
-                           '    def put(self, key, value):\n'
-                           '        if len(self.data) >= self.capacity and key not in self.data:\n'
-                           '            del self.data[next(iter(self.data))]\n'
-                           '        self.data[key] = value\n'},
-        cases=[
-            _case("target", head + "c = LRUCache(2)\nc.put(1, 1); c.put(2, 2); c.get(1); c.put(3, 3)\n"
-                                   "result = [c.get(1), c.get(2), c.get(3)]", [1, -1, 3]),
-            _case("target", head + "c = LRUCache(2)\nc.put(1, 1); c.put(2, 2); c.put(1, 10); c.put(3, 3)\n"
-                                   "result = [c.get(1), c.get(2), c.get(3)]", [10, -1, 3]),
-            _case("target", head + "c = LRUCache(3)\nc.put(1, 1); c.put(2, 2); c.put(3, 3)\n"
-                                   "c.get(1); c.get(2); c.put(4, 4)\n"
-                                   "result = [c.get(1), c.get(2), c.get(3), c.get(4)]", [1, 2, -1, 4]),
-            _case("regression", head + "c = LRUCache(1)\nresult = c.get(5)", -1),
-            _case("regression", head + "c = LRUCache(1)\nc.put(1, 1); c.put(2, 2)\n"
-                                       "result = [c.get(1), c.get(2)]", [-1, 2]),
-        ],
-        reference={"cache.py": 'class LRUCache:\n    def __init__(self, capacity):\n'
-                               '        self.capacity = capacity\n        self.data = {}\n\n'
-                               '    def get(self, key):\n        if key not in self.data:\n            return -1\n'
-                               '        value = self.data.pop(key)\n        self.data[key] = value\n'
-                               '        return value\n\n    def put(self, key, value):\n'
-                               '        if key in self.data:\n            self.data.pop(key)\n'
-                               '        elif len(self.data) >= self.capacity:\n'
-                               '            del self.data[next(iter(self.data))]\n        self.data[key] = value\n'},
-    )
-
-
-# ---------------------------------------------- bulk_discount (seeded)
-def discount_task(seed):
-    rng = random.Random(seed)
-    unit = rng.choice([4.99, 7.25, 12.5, 19.99])
-    t1 = rng.randint(5, 9)
-    t2 = t1 + rng.randint(5, 10)
-    d1 = rng.choice([5, 8, 10])
-    d2 = d1 + rng.choice([5, 7, 10])
-    header = (f"UNIT_PRICE = {unit}\n"
-              f"TIERS = [({t2}, {d2}), ({t1}, {d1})]  # (minimum quantity, percent off), highest first\n\n\n")
-    body = ('def order_total(quantity):\n    """Total price for `quantity` items after the best tier discount."""\n'
-            '    total = quantity * UNIT_PRICE\n    for minimum, percent in TIERS:\n'
-            '        if quantity {cmp} minimum:\n            total = total * (100 - percent) / 100\n'
-            '            break\n    return {ret}\n')
-    buggy = header + body.format(cmp=">", ret="int(total * 100) / 100")
-    fixed = header + body.format(cmp=">=", ret="round(total, 2)")
-
-    def total(src, quantity):
-        ns = {}
-        exec(src, ns)
-        return ns["order_total"](quantity)
-
-    def case(group, q):
-        return _case(group, f"from pricing import order_total\nresult = order_total({q})", total(fixed, q))
-
-    edge = [q for q in range(0, 40) if q not in (t1, t2) and total(buggy, q) != total(fixed, q)][:2]
-    safe = [q for q in range(0, 40) if q not in (t1, t2) and total(buggy, q) == total(fixed, q)][:3]
-    cases = [case("target", q) for q in [t1, t2] + edge] + [case("regression", q) for q in safe]
-    return TaskInstance(
-        task_id="bulk_discount", title="Fix the bulk discount (seeded)", difficulty="medium",
-        instructions=("`pricing.order_total` should give an order the discount of the highest tier whose "
-                      "minimum quantity it reaches (reaching the minimum counts), and round the total to "
-                      "2 decimal places. The tiers are defined at the top of the file."),
-        files={"pricing.py": buggy}, cases=cases, reference={"pricing.py": fixed},
+        task_id="direct_easy", title="Book a direct train", difficulty="easy",
+        instructions=describe(request, CANCEL_FEE), world=world, request=request,
+        reference=[("search_trains", {"origin": origin, "destination": destination}),
+                   ("book", {"train": good["number"], "class": travel_class, "travellers": [traveller]})],
     )
 
 
 TASKS = {
-    "slugify": slugify_task,
-    "parse_duration": duration_task,
-    "merge_intervals": intervals_task,
-    "lru_cache": lru_task,
-    "bulk_discount": discount_task,
+    "direct_easy": direct_task,
 }
-DEMO_TASK = "slugify"
+DEMO_TASK = "direct_easy"
 
 
 def build_task(task_id, seed):

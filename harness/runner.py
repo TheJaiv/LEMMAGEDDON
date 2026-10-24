@@ -9,9 +9,9 @@ from .env import PASS_SCORE
 from .tools import SPECS, TOOLS, TOOL_NAMES, check_args
 
 SYSTEM_PROMPT = (
-    "You are an autonomous software engineering agent working in a sandboxed Python project. "
-    "Use the provided tools to read files, edit them and run Python code. "
-    "Always respond with tool calls. When the task is complete, call the `finish` tool."
+    "You are a travel booking agent working with a railway booking system. "
+    "Use the provided tools to search trains, check seats, and make or cancel bookings. "
+    "Always respond with tool calls. When the bookings are complete, call the `finish` tool."
 )
 TRIMMED = "[older tool output removed to save context]"
 TRIMMED_ARGS = '{"note": "arguments removed to save context"}'

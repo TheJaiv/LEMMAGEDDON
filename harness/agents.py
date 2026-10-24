@@ -72,7 +72,7 @@ class OpenAIClient:
 class MockClient:
     """Offline stand-ins so the template runs with no API key.
 
-    mock/solver  writes the reference solution, then finishes.
+    mock/solver  plays the reference solution, then finishes.
     mock/idle    finishes immediately without doing anything.
     """
 
@@ -88,9 +88,7 @@ class MockClient:
         self.turn += 1
         calls = []
         if self.kind == "solver" and self.turn == 1:
-            for path, content in self.task.reference.items():
-                calls.append(("write_file", {"path": path, "content": content}))
-            calls.append(("run_python", {"code": "print('checked')"}))
+            calls = list(self.task.reference)
         else:
             calls.append(("finish", {}))
         tool_calls = [ToolCall(f"mock-{self.turn}-{i}", name, json.dumps(args))
@@ -112,7 +110,7 @@ def make_client(model, api_key, base_url, max_tokens=None):
 # -------------------------------------------------------------- baselines
 def oracle_actions(task):
     """The reference solution as a list of (tool, args) actions. Must score full marks."""
-    return [("write_file", {"path": path, "content": content}) for path, content in task.reference.items()]
+    return list(task.reference)
 
 
 def noop_actions(task):
