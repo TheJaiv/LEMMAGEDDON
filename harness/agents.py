@@ -62,7 +62,7 @@ class OpenAIClient:
 
 
 # ------------------------------------------------------- reading replies
-TEXT_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>|```(?:json)?\s*(.*?)```", re.S)
+TEXT_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>|```[\w+-]*\s*(.*?)```", re.S)   # any ```label
 JSON_START = re.compile(r"[\[{]")
 
 
@@ -73,8 +73,8 @@ def reply_from_response(response):
     of a string, missing call ids, names with stray spaces, the older single `function_call`
     field, content sent as a list of parts, and a response with no `choices` at all. Only when
     there is no structured tool call, it also reads tool calls written into the text:
-    <tool_call>{...}</tool_call>, a ```json block, or a JSON object or list anywhere in the text,
-    for example after a sentence of prose.
+    <tool_call>{...}</tool_call>, a code block with any label (```json, ```python), or a JSON
+    object or list anywhere in the text, for example after a sentence of prose.
     """
     raw, choices = _dump(response), _get(response, "choices") or []
     usage = _get(response, "usage")
@@ -96,15 +96,8 @@ def reply_from_response(response):
 
 def calls_from_text(text):
     """Tool calls written into the reply text by models that don't use the tool_calls field."""
-    chunks = [a or b for a, b in TEXT_CALL.findall(text)]
-    values = []
-    for chunk in chunks:
-        try:
-            values.append(json.loads(chunk))
-        except json.JSONDecodeError:
-            continue
-    if not chunks:
-        values = _json_values(text)
+    chunks = [a or b for a, b in TEXT_CALL.findall(text)] or [text]
+    values = [value for chunk in chunks for value in _json_values(chunk)]
     calls = []
     for data in values:
         for item in data if isinstance(data, list) else [data]:

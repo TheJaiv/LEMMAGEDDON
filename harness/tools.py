@@ -43,13 +43,20 @@ def check_args(name, args):
     spec = SPECS[name]
     for key in spec.get("required", []):
         if key not in args:
-            return f"missing required argument '{key}'"
+            return f"missing required argument '{key}'. {signature(name)}"
     for key, value in args.items():
         if key not in spec["properties"]:
-            return f"unexpected argument '{key}'"
+            return f"unexpected argument '{key}'. {signature(name)}"
         kind = spec["properties"][key]["type"]
         if kind == "string" and not isinstance(value, str):
             return f"argument '{key}' must be a string"
         if kind == "array" and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
             return f"argument '{key}' must be a list of strings"
     return None
+
+
+def signature(name):
+    """What a tool takes, in words, e.g. "search_trains takes: origin, destination (optional)"."""
+    spec = SPECS[name]
+    parts = [key if key in spec.get("required", []) else f"{key} (optional)" for key in spec["properties"]]
+    return f"{name} takes: {', '.join(parts) or 'no arguments'}"
