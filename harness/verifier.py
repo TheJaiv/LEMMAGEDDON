@@ -4,18 +4,21 @@ Programmatic only, no LLM. It reads the list of bookings from the sandbox, but
 recomputes every price, fee, time and seat count from the harness's own copy of the
 timetable, so a number reported by the sandbox is never trusted.
 
-    reward = covered x budget_ok x tidy
-      covered    share of travellers on one shared valid trip (route, connections, deadline, class)
-      budget_ok  1 if the total spent (tickets kept + cancellation fees) is within budget, else 0
-      tidy       1 - 0.1 per leftover or duplicate booking, never below 0.5
+    reward = covered x budget_score x tidy
+      covered       share of travellers on one shared valid trip (route, connections, deadline, class)
+      budget_score  total spent (tickets kept + cancellation fees) within budget: 1;
+                    up to 10% over: 0.5, so a trip over budget can never count as a success;
+                    more than 10% over: 0
+      tidy          1 - 0.1 per leftover or duplicate booking, never below 0.5
 
-Booking nothing covers no one, so it scores 0. Booking everything goes over budget, so it scores 0.
+Booking nothing covers no one, so it scores 0. Booking everything goes far over budget, so it scores 0.
 Travellers must travel together: if they are split across trains, only the biggest group counts.
 """
 from collections import Counter
 
 MAX_LEGS = 4          # the longest trip (number of trains) the verifier looks for
 MAX_SEARCH = 20000    # search steps, so a flood of bookings can't make the verifier hang
+OVER_BUDGET_GRACE = 0.10   # up to this share over budget halves the score; more gives 0
 
 
 def score_bookings(task, state):
@@ -88,11 +91,17 @@ def score_bookings(task, state):
         notes.append(f"leftover bookings: {', '.join(unused)}")
     leftover += len(unused)
 
-    budget_ok = 1 if spent <= request["budget"] else 0
-    if not budget_ok:
-        notes.append(f"spent Rs {spent}, over the budget of Rs {request['budget']}")
+    over = spent - request["budget"]
+    if over <= 0:
+        budget_score = 1
+    elif over <= OVER_BUDGET_GRACE * request["budget"]:
+        budget_score = 0.5
+        notes.append(f"spent Rs {spent}, Rs {over} over the budget of Rs {request['budget']}: score halved")
+    else:
+        budget_score = 0
+        notes.append(f"spent Rs {spent}, more than 10% over the budget of Rs {request['budget']}: score 0")
     tidy = max(0.5, 1 - 0.1 * leftover)
-    return _result(len(group) / len(travellers), budget_ok, tidy, leftover, spent, request, notes)
+    return _result(len(group) / len(travellers), budget_score, tidy, leftover, spent, request, notes)
 
 
 def _trips(legs, request):
@@ -118,7 +127,7 @@ def _trips(legs, request):
     return found
 
 
-def _result(covered, budget_ok, tidy, leftover, spent, request, notes):
-    return {"covered": round(covered, 4), "budget_ok": budget_ok, "tidy": round(tidy, 4),
-            "total": round(covered * budget_ok * tidy, 4),
+def _result(covered, budget_score, tidy, leftover, spent, request, notes):
+    return {"covered": round(covered, 4), "budget_score": budget_score, "tidy": round(tidy, 4),
+            "total": round(covered * budget_score * tidy, 4),
             "spent": spent, "budget": request["budget"], "leftover_bookings": leftover, "notes": notes}

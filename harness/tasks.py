@@ -322,12 +322,101 @@ def rebook_task(seed):
                         "connection too tight": [cancel, book(leg1, travel_class, group), book(tight, travel_class, group)]})
 
 
+# --------------------------------------------------- fix_connection_hard
+def fix_connection_task(seed):
+    """2 travellers hold a connection whose change is too tight. Replace only the second train:
+    the budget is too small to cancel both bookings and start over."""
+    rng = random.Random(f"fix_connection_hard:{seed}")
+    stations = rng.sample(CITIES, 7)
+    origin, hub, destination = stations[0], stations[1], stations[2]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 2)
+    numbers = train_numbers(rng)
+
+    leg1, leg2 = plant_connection(rng, numbers, origin, hub, destination, travel_class, group)
+    deadline = deadline_after(leg2["arrive"])
+    tight = tight_train(rng, next(numbers), leg1, leg2)
+    existing = [{"id": f"B{i}", "train": t["number"], "class": travel_class, "travellers": list(group),
+                 "status": "active", "price": fare(t, travel_class) * len(group), "fee": 0}
+                for i, t in ((1, leg1), (2, tight))]
+    keep, drop = existing
+    # enough to drop B2 and book leg2, but not to also cancel and rebook B1
+    cost = keep["price"] + round(drop["price"] * CANCEL_FEE) + fare(leg2, travel_class) * len(group)
+    budget = cost + 10 * int(round(keep["price"] * CANCEL_FEE) * rng.uniform(0.3, 0.7) / 10)
+    direct = late_train(rng, next(numbers), origin, destination, deadline)
+    trains = {t["number"]: t for t in (leg1, leg2, tight, direct)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub), (hub, destination)})
+
+    return build("fix_connection_hard", "Fix a connection that is too tight", "hard", group, origin,
+                 destination, deadline, travel_class, budget, stations, trains, bookings=existing,
+                 reference=[("list_bookings", {}), ("cancel", {"booking_id": "B2"}),
+                            search(hub, destination), book(leg2, travel_class, group)],
+                 traps={"keep both bookings": [],
+                        "cancel both and rebook": [("cancel", {"booking_id": "B1"}), ("cancel", {"booking_id": "B2"}),
+                                                   book(leg1, travel_class, group), book(leg2, travel_class, group)],
+                        "add the good train, keep the tight one": [book(leg2, travel_class, group)],
+                        "direct but late": [("cancel", {"booking_id": "B1"}), ("cancel", {"booking_id": "B2"}),
+                                            book(direct, travel_class, group)]})
+
+
+# -------------------------------------------------------- long_trip_hard
+def long_trip_task(seed):
+    """3 travellers, only a trip with two changes works. Every shortcut breaks a rule:
+    the direct train is late, one route has 2 seats, the other has a change that is too tight."""
+    rng = random.Random(f"long_trip_hard:{seed}")
+    stations = rng.sample(CITIES, 8)
+    origin, hub1, hub2, destination = stations[0], stations[1], stations[2], stations[3]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 3)
+    numbers = train_numbers(rng)
+
+    seats = lambda: {travel_class: len(group) + rng.randint(0, 3)}
+    leg1 = make_train(rng, next(numbers), origin, hub1, rng.randrange(300, 480, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    leg2 = make_train(rng, next(numbers), hub1, hub2, leg1["arrive"] + rng.randrange(40, 90, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    leg3 = make_train(rng, next(numbers), hub2, destination, leg2["arrive"] + rng.randrange(40, 90, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    deadline = deadline_after(leg3["arrive"])
+    budget = budget_for(rng, sum(fare(t, travel_class) for t in (leg1, leg2, leg3)) * len(group))
+
+    direct = late_train(rng, next(numbers), origin, destination, deadline)
+    # shortcut via hub1: on time, but only 2 seats in the class for a group of 3
+    depart = leg1["arrive"] + rng.randrange(40, 90, 5)
+    short = make_train(rng, next(numbers), hub1, destination, depart,
+                       min(rng.randrange(120, 240, 5), deadline - 10 - depart), list(CLASSES),
+                       seats={travel_class: len(group) - 1})
+    # shortcut via hub2: arrives 5-20 minutes before leg3 leaves, too tight to change
+    arrive = leg3["depart"] - rng.randrange(5, 25, 5)
+    duration = min(rng.randrange(150, 300, 5), arrive - 300)
+    tight = make_train(rng, next(numbers), origin, hub2, arrive - duration, duration, list(CLASSES))
+    trains = {t["number"]: t for t in (leg1, leg2, leg3, direct, short, tight)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub1), (hub1, hub2), (hub2, destination),
+                     (hub1, destination), (origin, hub2)})
+
+    return build("long_trip_hard", "Two changes for a group of three", "hard", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains,
+                 reference=[search(origin), search(hub1), search(hub2, destination),
+                            book(leg1, travel_class, group), book(leg2, travel_class, group),
+                            book(leg3, travel_class, group)],
+                 traps={"direct but late": [book(direct, travel_class, group)],
+                        "two of three on the 2-seat train": [book(leg1, travel_class, group),
+                                                            book(short, travel_class, group[:2])],
+                        "change too tight at the second hub": [book(tight, travel_class, group),
+                                                               book(leg3, travel_class, group)],
+                        "first two trains only": [book(leg1, travel_class, group), book(leg2, travel_class, group)]})
+
+
 TASKS = {
     "direct_easy": direct_task,
     "soldout_easy": soldout_task,
     "connection_medium": connection_task,
     "budget_medium": budget_task,
     "rebook_hard": rebook_task,
+    "fix_connection_hard": fix_connection_task,
+    "long_trip_hard": long_trip_task,
 }
 DEMO_TASK = "direct_easy"
 
