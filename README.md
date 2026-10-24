@@ -1,194 +1,173 @@
-# RL Environment Template
+# LEMMAGEDDON: a train-booking environment that can't be broken
 
-A small, working example of the run contract for the hackathon. It has five tiny coding tasks, a verifier, a reference-solution check, a no-op check, and a model loop that talks to any model through an OpenAI-compatible endpoint.
+An RL environment where the agent is a travel booking assistant. It gets a trip request and must
+leave behind train bookings that satisfy every rule: route, connections, arrival deadline, class,
+budget, and everyone travelling together. A programmatic verifier checks the final bookings and
+accepts **any** valid itinerary; there is no single answer to copy.
 
-**Your environment must follow the same contract.** Judges will clone your repo's `main` branch, add a model and key, run **one command**, and watch what happens. Use this repo as a starting point for the layout, the harness and the logging.
-
-> This is a minimal starting point that shows the contract. It is not a hardened environment: strengthening your own isolation, verifier and error handling is part of the challenge.
-
-
+**Demo task: `direct_easy`** (the default `TASK_ID`), seed 0.
 
 ## Quick start
 
-You need Linux, macOS or WSL with Docker and Docker Compose v2. Nothing else.
+You need Docker with Docker Compose v2. Nothing else.
 
 ```bash
-cp .env.example .env          # 1. create your config
-# edit .env: set MODEL, API_KEY and BASE_URL (skip this to try the offline demo)
-docker compose up --build --abort-on-container-exit --exit-code-from harness   # 2. run everything
+cp .env.example .env        # set MODEL, API_KEY and BASE_URL (leave MODEL=mock/solver for an offline demo)
+docker compose up --build --abort-on-container-exit --exit-code-from harness
 ```
 
-With the default `MODEL=mock/solver` it runs offline with no API key, so you can see the whole flow first.
+One command builds both images, runs the reference solution and the no-op agent on the task
+(both must pass before any model call), then runs the model. Logs go to `logs/<run-id>/`.
 
-## Calling the model
+## The task
 
-Your model name, API key and base URL arrive in the API key email. Every model is called the same way, through an OpenAI-compatible client:
+What the agent sees at the start (`rebook_hard`, seed 0):
 
-```python
-import openai
-
-client = openai.OpenAI(
-    api_key="api_key",
-    base_url="base_url"
-)
-
-# Example with text only
-response = client.chat.completions.create(
-    model="model_name",
-    messages=[
-        {
-            "role": "user",
-            "content": "Hi, How are you?"
-        }
-    ]
-)
-
-print(response)
+```
+Book train tickets for this trip.
+Travellers: Vikram, Shrey (all travel together on the same trains).
+From: Ahmedabad   To: Delhi
+Arrive by: 13:30 at the latest. All trains run on the same day.
+Class: 2A on every train.
+Budget: Rs 4250 in total for all travellers. Everything counts: the tickets you keep (including existing bookings) and cancellation fees (20% of a booking's price).
+If you change trains, the next train must leave from the same station at least 30 minutes after the previous one arrives.
+Every traveller needs a seat on every train of the trip. Leave no extra bookings.
+Current bookings (already paid):
+  B1: train 16346 Ahmedabad 10:15 -> Delhi 14:20, class 2A, for Vikram, Shrey, Rs 2770
 ```
 
-In this template the three values come from environment variables, so nothing is hard-coded: `API_KEY`, `BASE_URL` and `MODEL` in your `.env`. The harness (`harness/agents.py`) makes the same call, with your tools added. To check your credentials before anything else:
+**Success** = reward ≥ 0.95, which requires every rule to hold.
+
+### Tools
+
+Domain tools only: no code execution, no file access.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `search_trains` | `origin`, `destination` (optional) | trains from a station: number, times, price per class |
+| `check_seats` | `train`, `class` | seats left in that class |
+| `book` | `train`, `class`, `travellers` (list of names) | booking id and price, or an error |
+| `cancel` | `booking_id` | fee and refund (20% of the price is kept) |
+| `list_bookings` | none | every booking and the total spent |
+| `finish` | none | ends the episode |
+
+State persists within an episode: booking takes seats, cancelling returns them.
+
+### Reward
+
+```
+reward = covered × budget_score × tidy
+```
+
+| Part | Meaning |
+|---|---|
+| `covered` | share of travellers on one shared valid trip: origin to destination, each change at the same station ≥ 30 min later, the required class on every train, arriving by the deadline. If travellers are split across trains, only the biggest group counts |
+| `budget_score` | tickets kept + cancellation fees within budget: 1; up to 10% over: 0.5; more: 0 |
+| `tidy` | 1 − 0.1 per leftover or duplicate booking, never below 0.5 |
+
+Booking nothing scores 0. Booking everything goes far over budget and scores 0. An over-budget
+trip can never reach 0.95. The verifier reads only *which* bookings exist; it recomputes every
+price, fee, time and seat count from its own copy of the timetable, so numbers reported by the
+sandbox are never trusted. Every score comes with plain-language notes, for example
+`"Shrey: on different trains from the rest of the group"`.
+
+## Task set
+
+Every task is a seeded generator: each seed gives a different timetable and request, and the same
+seed always gives the same one. The generator plants one valid trip (the reference solution), then
+trap trains that each break exactly one rule.
+
+| Task | Level | What makes it hard |
+|---|---|---|
+| `direct_easy` | easy | a cheaper train arrives after the deadline |
+| `soldout_easy` | easy | the earliest train is sold out in the class; a group must not be split |
+| `connection_medium` | medium | no direct train fits; change at a hub with at least 30 minutes |
+| `budget_medium` | medium | the fast direct express is over budget; a cheaper connection fits |
+| `rebook_hard` | hard | an existing booking arrives late: cancel it and rebook via a hub |
+| `fix_connection_hard` | hard | an existing connection is too tight; the budget only allows replacing the second train |
+| `long_trip_hard` | hard | 3 travellers, only a two-change trip works; every shortcut breaks a rule |
+
+## Configuration (`.env`)
+
+| Variable | Meaning |
+|---|---|
+| `MODEL`, `API_KEY`, `BASE_URL` | any OpenAI-compatible endpoint. `MODEL=mock/solver` or `mock/idle` runs offline |
+| `TASK_ID` | one of the tasks above (default `direct_easy`) |
+| `SEED` | seed for the task generator (default `0`) |
+| `MODE` | `full` (default): checks, then the model on `TASK_ID`. `all`: checks for every task, then the model on each. `baselines`: checks for every task, no model call |
+| `APPEND_FILE` | a text file in `inputs/` added to the end of the system prompt exactly as written (default `inputs/append.txt` if present). A named file that is missing, empty or not UTF-8 stops the run |
+| `MAX_TOKENS` | optional cap on each model reply |
+
+Examples:
+```bash
+MODE=baselines docker compose up --build --abort-on-container-exit --exit-code-from harness
+TASK_ID=long_trip_hard SEED=7 docker compose up --build --abort-on-container-exit --exit-code-from harness
+```
+
+## Outputs and exit codes
+
+`logs/<run-id>/` (run ids are UTC timestamps):
+- `gate.jsonl`, `gate.json`: reference solution and no-op results per task
+- `episode.jsonl` (`episode-<task>.jsonl` with `MODE=all`): one line per model reply with the
+  timestamp, step, seed, full model input, raw model output, parsed actions, tool results, errors,
+  state hash, reward components and total, tokens and latency; a final line with the termination
+  reason and the verifier's result
+- `summary.json`
+
+Exit codes: `0` finished, `1` crash, `2` a baseline check failed, `3` bad configuration.
+
+## Limits in a model run
+
+| Limit | Value |
+|---|---|
+| Steps | 40 (one step = one model reply) |
+| Time | 10 minutes from the first model request |
+| Tool calls per reply | 10 (extra calls are not run and get an error back) |
+| Tool output | 4,000 characters |
+| Context | old tool outputs trimmed to keep the conversation under about 48K tokens |
+
+Malformed replies (no tool call, invalid JSON, unknown tool, wrong argument types) get a clear
+error back and use up a step; the run continues. Termination reasons: `success`, `failure`,
+`step_cap`, `time_cap`, `crash`.
+
+## Isolation
+
+- **harness** container: task generator, reference solutions, verifier, model client. It is the
+  only container with internet access, used for the model API.
+- **sandbox** container: the booking system the tools talk to. It sits on an internal Docker
+  network with no internet, runs as a non-root user with all Linux capabilities dropped, and its
+  image contains none of the harness code.
+- No tool runs code or touches files, so the agent can only act through the six booking tools.
+
+## Tests
 
 ```bash
-API_KEY=... BASE_URL=... MODEL=... python check_model.py
+python3 tests/check_tasks.py 300
 ```
 
-When judges run your repo they change only these values (and the task), so your environment must work whichever model they plug in.
-
-## What one command does
-
-```
-docker compose up --build ...
-        |
-        |-- builds both images, starts the sandbox
-        v
- 1. ORACLE check   reference solution runs through the environment      must score >= 0.95
- 2. NO-OP check    an agent that gives up immediately                   must score <= 0.05
-        |   if either fails: stop, the model is never called
-        v
- 3. MODEL run      your chosen model works on the task                  clock starts at its first request
-        |
-        v
- logs/<run-id>/    gate.jsonl, gate.json, episode.jsonl, summary.json
-```
-
-Nothing is run separately. Build, both checks and the model run all happen from the single command.
-
-## The contract
-
-
-|                                |                                                                                                                                                                              |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Command**                    | `docker compose up --build --abort-on-container-exit --exit-code-from harness`                                                                                               |
-| **Config** (`.env`)            | `MODEL`, `API_KEY`, `BASE_URL`, `TASK_ID`, `SEED`, `MODE`, optional `MAX_TOKENS`                                                                                             |
-| **Extra instructions**         | a text file in `inputs/` named by `APPEND_FILE` in `.env` (default `inputs/append.txt`), added to the system prompt exactly as written. See [Extra instructions](#extra-instructions)                                                                                             |
-| **Modes** (`MODE`)             | `full` (default): checks, then the model on `TASK_ID`. `all`: checks for every task, then the model on every task in turn. `baselines`: checks for every task, no model call |
-| **Outputs** (`logs/<run-id>/`) | `gate.jsonl` and `gate.json` (baseline checks), `episode.jsonl` (one line per step; `episode-<task>.jsonl` per task with `MODE=all`), `summary.json`                         |
-| **Exit code**                  | `0` finished, `1` crash, `2` a baseline check failed, `3` bad configuration                                                                                                  |
-
-
-
-
-### Limits used in the live run
-
-
-| Limit                | Value                                                                                                                        |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Build                | 3 minutes from a fresh clone with an empty Docker cache                                                                      |
-| Baseline checks      | 2 minutes for the oracle and no-op checks on the chosen task (printed and saved as `gate_seconds` in `gate.json`)            |
-| Time per model run   | 10 minutes, starting at the first model request (build and baseline checks are not counted)                                  |
-| Steps                | 40. **One step is one model reply**, however many tool calls it holds                                                        |
-| Tool calls per reply | 10. Extra calls are not run and get an error back                                                                            |
-| Unreadable replies   | An unreadable or tool-less reply still uses a step. The agent gets a clear error and the run continues                       |
-| Tool output          | cut at 4,000 characters                                                                                                      |
-| Context              | trimmed by the harness so the conversation stays under about 48K tokens; a provider context-overflow error counts as a crash |
-
-
-
+For every task and 300 seeds: the same seed builds the same task; the reference solution runs
+without tool errors and scores ≥ 0.95; doing nothing scores ≤ 0.05; every planted trap scores
+< 0.95; every train runs within one day. It uses the real sandbox tool code and the real verifier
+and needs only Python 3.
 
 ## Layout
 
 ```
 docker-compose.yml        two services: sandbox (no internet) and harness
-Dockerfile.sandbox        image for the sandbox
 Dockerfile.harness        image for the harness
-check_model.py            one-message connectivity check for your credentials
-sandbox/server.py         runs the agent's tools in an isolated workspace
-harness/run.py            entry point: oracle, then no-op, then the model
-harness/runner.py         step loop, limits, context trimming, telemetry
-harness/env.py            reset / step / score (the verifier lives here)
-harness/tasks.py          the tasks, with hidden checks and a reference solution
-harness/tools.py          tool schemas shown to the model
+Dockerfile.sandbox        image for the sandbox
+sandbox/server.py         the booking system and its tools
+harness/run.py            entry point: baseline checks, then the model
+harness/runner.py         step loop, limits, context trimming, logging
+harness/env.py            reset / step / state / score
+harness/tasks.py          seeded task generators, reference solutions and traps
+harness/verifier.py       the rules and the reward
+harness/tools.py          tool schemas shown to the model, argument checks
 harness/agents.py         OpenAI-compatible client, offline mock models, baselines
+tests/check_tasks.py      checks every task on many seeds
+check_model.py            one-message check of your model credentials
 ```
 
-The verifier's expected answers and reward code live in the harness container. The agent only ever touches the sandbox container, which has no internet access.
-
-## Try it
-
-```bash
-# offline demo: the reference-solution mock solves the task
-docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# an agent that does nothing (should end as a failure with reward 0)
-MODEL=mock/idle docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# run every task's baseline checks without a model: use this for your baseline results
-MODE=baselines docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# the model on every task, one after another, ignores TASK_ID (each gets its own 40 steps and 10 minutes)
-MODE=all docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# a different task or seed
-TASK_ID=bulk_discount SEED=7 docker compose up --build --abort-on-container-exit --exit-code-from harness
-```
-
-Variables can be set in `.env` or on the command line as above.
-
-## Extra instructions
-
-In Run B the judges add an instructions file to the system prompt, the same file for every team. Its contents aren't disclosed. To check that your harness picks up such a file:
-
-```bash
-# 1. put the instructions in a file under inputs/
-echo "Explain your plan in one line before each tool call." > inputs/extra.txt
-# 2. name it in .env (or on the command line), then run as usual. No rebuild is needed.
-APPEND_FILE=inputs/extra.txt docker compose up --build --abort-on-container-exit --exit-code-from harness
-```
-
-The terminal shows which file was loaded with its size and hash, and the run saves a copy as `logs/<run-id>/append.txt`. `summary.json` records it under `append`, and every step's `model_input` contains the full system prompt. A named file that is missing, empty or not UTF-8 stops the run with exit code 3. Your harness must add the file unchanged and must not special-case it.
-
-## Keeping the build fast
-
-The build and both checks must fit in 5 minutes on the judges' machine (3 for the build, 2 for the checks), and the judges' network may be slower than yours. This template builds in under a minute from an empty cache. To check yours the way judges will see it:
-
-```bash
-docker builder prune -af && time docker compose build --no-cache
-```
-
-- Pin every dependency to an exact version in `requirements.txt`, including transitive ones. `>=` can pull a new major version on the day.
-- Install only what the environment needs. Avoid large toolchains (CUDA, full `build-essential`, browsers you don't use), model weights and datasets downloaded at build time. Ship small fixed data in the repo instead.
-- Prefer `-slim` base images and packages with prebuilt wheels. Compiling from source is the usual cause of a slow build.
-- Nothing may be downloaded at run time: the sandbox has no internet.
-
-
-
-## Make it your own
-
-1. Replace the tasks in `harness/tasks.py`. A task builds from a seed and provides the starting files, hidden checks and a **reference solution**. `bulk_discount` shows how a seed can generate a different variant each time.
-2. Keep both baselines honest. The reference solution must score at least 0.95 and the no-op agent at most 0.05 on **every** task. The run stops before the model is called if either check fails, which is how a leaky verifier gets caught early. (While building this template, the no-op check flagged one of its own tasks that paid out for doing nothing.)
-3. Change the tools in `harness/tools.py` and `sandbox/server.py`, and the scoring in `harness/env.py::Env.score`.
-4. Run `MODE=baselines` and keep `logs/<run-id>/gate.json`; it goes in your submission zip as your baseline results.
-5. Run the model a few times, and keep the logs from at least 3 runs for your zip. `MODE=all` is a quick way to see that every task holds up, since judges may pick any of them for Run B.
-
-
-
-## Submitting
-
-Judges run everything from a clone of your repo's `main` branch, so what matters is what is in the repo. The zip you upload is reference material only (baseline results, test-run logs, sample trajectories, design doc and deck). See the problem statement for the exact list and deadline.
-
-## Notes
-
-- Your GPT-Luna key is for testing your environment only. It can't be used for anything else.
-- Never commit API keys. `.env` is ignored by git.
-- If your environment needs an LLM of its own, you must bring your own setup for it.
-
+Built on the hackathon template https://github.com/ayushmothiya1/RL-ENV-TEMPLATE (Docker setup,
+step loop, logging, baseline gate). The train world, tools, verifier, tasks and tests were written
+during the hackathon.
