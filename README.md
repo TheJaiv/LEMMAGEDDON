@@ -56,14 +56,15 @@ State persists within an episode: booking takes seats, cancelling returns them.
 ### Reward
 
 ```
-reward = covered × budget_score × tidy
+reward = covered × budget_score × tidy × best_choice
 ```
 
 | Part | Meaning |
 |---|---|
-| `covered` | share of travellers on one shared valid trip: origin to destination, each change at the same station ≥ 30 min later, the required class on every train, arriving by the deadline. If travellers are split across trains, only the biggest group counts |
+| `covered` | share of travellers on one shared valid trip: origin to destination, each change at the same station ≥ 30 min later, the required class on every train, arriving by the deadline, and (when the request says so) a pantry car and at most N stops on every train. If travellers are split across trains, only the biggest group counts |
 | `budget_score` | tickets kept + cancellation fees within budget: 1; up to 10% over: 0.5; more: 0 |
 | `tidy` | 1 − 0.1 per leftover or duplicate booking, never below 0.5 |
+| `best_choice` | only when the request asks for the cheapest or best-value trip: 1 if the trip is as good as the best valid trip the verifier finds by searching the whole timetable, else 0.6 |
 
 Booking nothing scores 0. Booking everything goes far over budget and scores 0. An over-budget
 trip can never reach 0.95. The verifier reads only *which* bookings exist; it recomputes every
@@ -86,6 +87,12 @@ trap trains that each break exactly one rule.
 | `rebook_hard` | hard | an existing booking arrives late: cancel it and rebook via a hub |
 | `fix_connection_hard` | hard | an existing connection is too tight; the budget only allows replacing the second train |
 | `long_trip_hard` | hard | 3 travellers, only a two-change trip works; every shortcut breaks a rule |
+| `facilities_medium` | medium | needs a pantry car and at most N stops: of four train types on the route, only one fits |
+| `cheapest_medium` | medium | a direct train and a connection both fit: book the cheaper one (either can win) |
+| `value_hard` | hard | both fit and time has a price (Rs per hour): book the better value (either can win) |
+
+Trains come in four types with different speed, price, stops and facilities: Rajdhani (fast,
+dear, pantry, 2–4 stops), Superfast, Express, and Passenger (slow, cheap, no pantry, 18–30 stops).
 
 ## Results so far
 
@@ -205,7 +212,7 @@ python3 tests/check_exploits.py    # attempts to get undeserved reward
   with no flags, `mock/idle` scores ≤ 0.05, and `mock/cheater` scores ≤ 0.05 without crashing the
   run and raises every flag it provokes.
 - `check_parsing.py`: 18 reply shapes; the parser finds the right calls, or none, and never crashes.
-- `check_exploits.py`, on 50 seeds of every task (7,450 attempts, 0 problems):
+- `check_exploits.py`, on 50 seeds of every task (10 tasks, 10,591 attempts, 0 problems; 42,389 on 200 seeds):
   - 11 exploits must score below 0.95 when the sandbox accepts them: lookalike (Cyrillic) names, a
     traveller listed twice, every train booked twice, one traveller left out, an extra booking,
     the wrong class, instructions as a name, 100 travellers, made-up train numbers, half a trip,

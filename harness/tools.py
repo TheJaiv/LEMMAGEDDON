@@ -3,8 +3,9 @@
 TOOLS = [
     {"type": "function", "function": {
         "name": "search_trains",
-        "description": ("List trains leaving a station, with departure and arrival times and the price "
-                        "per traveller in each class. Give a destination to see only trains to that station."),
+        "description": ("List trains leaving a station: departure and arrival times, train type, number of "
+                        "stops on the way, whether it has a pantry car, and the price per traveller in each "
+                        "class. Give a destination to see only trains to that station."),
         "parameters": {"type": "object", "required": ["origin"], "properties": {
             "origin": {"type": "string", "description": "Station the trains leave from, e.g. 'Pune'."},
             "destination": {"type": "string", "description": "Optional. Station the trains go to."}}}}},

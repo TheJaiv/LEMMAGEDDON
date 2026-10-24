@@ -84,9 +84,10 @@ def tool_search_trains(args):
     where = f"from {origin} to {destination}" if destination else f"from {origin}"
     if not found:
         return f"No trains {where}."
-    lines = [leg(t) + "   " + " | ".join(f"{c} Rs {f['price']}" for c, f in t["classes"].items())
-             for t in found]
-    return f"Trains {where} (price is per traveller):\n" + "\n".join(lines)
+    lines = [f"{leg(t)}   {t.get('kind', 'Express')}, {t.get('stops', 0)} stops, "
+             f"{'pantry' if t.get('pantry') else 'no pantry'}   "
+             + " | ".join(f"{c} Rs {f['price']}" for c, f in t["classes"].items()) for t in found]
+    return f"Trains {where} (type, stops on the way, pantry car, price per traveller):\n" + "\n".join(lines)
 
 
 def tool_check_seats(args):

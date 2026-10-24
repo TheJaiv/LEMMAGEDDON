@@ -13,10 +13,15 @@ import math
 import random
 from dataclasses import dataclass, field
 
+from .verifier import best_trip
+
 CITIES = ["Mumbai", "Pune", "Nashik", "Surat", "Vadodara", "Ahmedabad", "Nagpur", "Indore",
           "Bhopal", "Jaipur", "Delhi", "Agra", "Lucknow", "Hyderabad", "Bengaluru", "Chennai"]
 NAMES = ["Jaiv", "Shrey", "Sahil", "Kabir", "Priya", "Arjun", "Tanisha", "Vikram", "Isha", "Rohan"]
 CLASSES = {"SL": 1.6, "3A": 4.0, "2A": 5.8}   # class -> rupees per minute of travel, roughly
+# train type -> how slow it is (x travel time), price factor, stops on the way, pantry car (None: either)
+KINDS = {"Rajdhani": (1.0, 1.5, (2, 4), True), "Superfast": (1.15, 1.15, (4, 8), True),
+         "Express": (1.3, 1.0, (8, 14), None), "Passenger": (1.7, 0.6, (18, 30), False)}
 CANCEL_FEE = 0.2                               # share of the price kept when a booking is cancelled
 MIN_CONNECTION = 30                            # minutes needed between trains at a change
 
@@ -42,17 +47,33 @@ def train_numbers(rng):
     return iter(str(n) for n in rng.sample(range(11001, 22999), 20))
 
 
-def make_train(rng, number, origin, destination, depart, duration, classes, seats=None):
+def make_train(rng, number, origin, destination, depart, duration, classes, seats=None, kind="Express",
+               price_factor=1):
     """One train: a single leg from origin to destination. `seats` fixes chosen seat counts."""
     fares = {}
     for name in CLASSES:                          # keep a fixed class order: SL, 3A, 2A
         if name in classes:
-            price = 5 * round(duration * CLASSES[name] * rng.uniform(0.9, 1.1) / 5)
+            price = 5 * round(duration * CLASSES[name] * price_factor * rng.uniform(0.9, 1.1) / 5)
             fares[name] = {"price": price, "seats": rng.randint(4, 30)}
     for name, count in (seats or {}).items():
         fares[name]["seats"] = count
     return {"number": number, "origin": origin, "destination": destination,
-            "depart": depart, "arrive": depart + duration, "classes": fares}
+            "depart": depart, "arrive": depart + duration, "classes": fares, **features(number, kind)}
+
+
+def features(number, kind):
+    """Type, stops and pantry. Drawn from the train number, not the task's random generator, so
+    adding them did not change any earlier task's times, prices or seats."""
+    rng = random.Random(f"features:{number}")
+    _, _, stops, pantry = KINDS[kind]
+    return {"kind": kind, "stops": rng.randint(*stops), "pantry": rng.random() < 0.6 if pantry is None else pantry}
+
+
+def kind_train(rng, number, origin, destination, depart, base, kind, seats=None):
+    """A train of a given type: `base` is how long the fastest type would take on this route."""
+    slow, price_factor, _, _ = KINDS[kind]
+    return make_train(rng, number, origin, destination, depart, 5 * round(base * slow / 5), list(CLASSES),
+                      seats=seats, kind=kind, price_factor=price_factor)
 
 
 def late_train(rng, number, origin, destination, deadline):
@@ -136,16 +157,38 @@ def describe(request, trains, bookings):
             f"(including existing bookings) and cancellation fees ({round(CANCEL_FEE * 100)}% of a booking's price).\n"
             f"If you change trains, the next train must leave from the same station at least "
             f"{request['min_connection']} minutes after the previous one arrives.\n"
+            f"{extra_rules(request)}"
             f"Every traveller needs a seat on every train of the trip. Leave no extra bookings.\n"
             f"{current}\n"
             f"Use the tools to search trains, check seats, book and cancel. When the bookings are done, call `finish`.")
 
 
+def extra_rules(request):
+    """Sentences for the optional rules: pantry car, stops, and which valid trip is best."""
+    lines = []
+    if request.get("needs_pantry"):
+        lines.append("Every train must have a pantry car (meals on board).")
+    if request.get("max_stops") is not None:
+        lines.append(f"Every train may make at most {request['max_stops']} stops on the way.")
+    if request.get("objective") == "cheapest":
+        lines.append("Several trips may meet every rule: book the one with the lowest total ticket price.")
+    if request.get("objective") == "value":
+        lines.append(f"Several trips may meet every rule. The travellers value their time at Rs "
+                     f"{request['time_value']} per hour each: book the trip with the lowest ticket price "
+                     f"+ Rs {request['time_value']} x hours of travel (first departure to final arrival), "
+                     f"per traveller.")
+    return "".join(line + "\n" for line in lines)
+
+
+def make_request(group, origin, destination, deadline, travel_class, budget, **rules):
+    return {"travellers": list(group), "origin": origin, "destination": destination,
+            "deadline": deadline, "min_connection": MIN_CONNECTION,
+            "travel_class": travel_class, "budget": budget, **rules}
+
+
 def build(task_id, title, difficulty, group, origin, destination, deadline, travel_class, budget,
-          stations, trains, reference, traps, bookings=()):
-    request = {"travellers": list(group), "origin": origin, "destination": destination,
-               "deadline": deadline, "min_connection": MIN_CONNECTION,
-               "travel_class": travel_class, "budget": budget}
+          stations, trains, reference, traps, bookings=(), **rules):
+    request = make_request(group, origin, destination, deadline, travel_class, budget, **rules)
     world = {"stations": sorted(stations), "trains": trains, "travellers": list(group),
              "cancel_fee": CANCEL_FEE, "bookings": [dict(b) for b in bookings]}
     return TaskInstance(task_id=task_id, title=title, difficulty=difficulty,
@@ -409,6 +452,138 @@ def long_trip_task(seed):
                         "first two trains only": [book(leg1, travel_class, group), book(leg2, travel_class, group)]})
 
 
+# --------------------------------------------------- facilities_medium
+def facilities_task(seed):
+    """1-2 travellers need a pantry car and few stops. Four types of train run the same route:
+    the cheap Passenger has no pantry and many stops, the Express stops too often, the Rajdhani
+    is over budget, and the Superfast fits."""
+    rng = random.Random(f"facilities_medium:{seed}")
+    stations = rng.sample(CITIES, 6)
+    origin, destination = stations[0], stations[1]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, rng.randint(1, 2))
+    numbers = train_numbers(rng)
+    base, max_stops = rng.randrange(150, 240, 5), rng.choice([6, 7, 8])
+    seats = lambda: {travel_class: len(group) + rng.randint(1, 6)}
+
+    good = kind_train(rng, next(numbers), origin, destination, rng.randrange(420, 600, 5), base, "Superfast", seats())
+    good["stops"] = min(good["stops"], max_stops)
+    slow = kind_train(rng, next(numbers), origin, destination, rng.randrange(300, 360, 5), base, "Passenger", seats())
+    many = kind_train(rng, next(numbers), origin, destination, rng.randrange(330, 480, 5), base, "Express", seats())
+    many["pantry"], many["stops"] = True, max(many["stops"], max_stops + 2)   # only the stops are wrong
+    fast = kind_train(rng, next(numbers), origin, destination, rng.randrange(420, 600, 5), base, "Rajdhani", seats())
+    deadline = deadline_after(max(t["arrive"] for t in (good, slow, many, fast)))
+    budget = budget_for(rng, fare(good, travel_class) * len(group), 1.05, 1.15)
+    if fare(fast, travel_class) * len(group) <= budget:                       # the Rajdhani must not fit
+        fast["classes"][travel_class]["price"] = 5 * math.ceil(budget * rng.uniform(1.15, 1.35) / len(group) / 5)
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    trains = {t["number"]: t for t in (good, slow, many, fast, late)}
+    add_noise(rng, trains, numbers, stations, avoid={(origin, destination)}, count=8)
+
+    return build("facilities_medium", "Pantry car and few stops", "medium", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains, needs_pantry=True, max_stops=max_stops,
+                 reference=[search(origin, destination), book(good, travel_class, group)],
+                 traps={"Passenger: no pantry, many stops": [book(slow, travel_class, group)],
+                        "Express: too many stops": [book(many, travel_class, group)],
+                        "Rajdhani: over budget": [book(fast, travel_class, group)],
+                        "late train": [book(late, travel_class, group)]})
+
+
+# ----------------------------------------------------- cheapest_medium
+def cheapest_task(seed):
+    """1-2 travellers. A direct train and a connection both meet every rule: book the cheaper one
+    (either can be cheaper, 50/50). A cheaper direct train arrives late; a cheaper change is too tight."""
+    rng = random.Random(f"cheapest_medium:{seed}")
+    stations = rng.sample(CITIES, 7)
+    origin, hub, destination = stations[0], stations[1], stations[2]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, rng.randint(1, 2))
+    numbers = train_numbers(rng)
+    seats = lambda: {travel_class: len(group) + rng.randint(1, 5)}
+
+    direct = kind_train(rng, next(numbers), origin, destination, rng.randrange(420, 600, 5),
+                        rng.randrange(180, 270, 5), rng.choice(["Rajdhani", "Superfast"]), seats())
+    leg1 = kind_train(rng, next(numbers), origin, hub, rng.randrange(330, 450, 5), rng.randrange(90, 150, 5),
+                      "Express", seats())
+    leg2 = kind_train(rng, next(numbers), hub, destination, leg1["arrive"] + rng.randrange(40, 100, 5),
+                      rng.randrange(90, 150, 5), rng.choice(["Express", "Passenger"]), seats())
+    connection = fare(leg1, travel_class) + fare(leg2, travel_class)
+    if rng.random() < 0.5:                                                    # the direct train is clearly dearer
+        direct["classes"][travel_class]["price"] = 5 * math.ceil(connection * rng.uniform(1.25, 1.5) / 5)
+    else:                                                                     # ... or clearly cheaper
+        direct["classes"][travel_class]["price"] = 5 * math.floor(connection * rng.uniform(0.6, 0.8) / 5)
+    cheaper, dearer = sorted((fare(direct, travel_class), connection))
+    deadline = deadline_after(max(direct["arrive"], leg2["arrive"]))
+    budget = budget_for(rng, dearer * len(group), 1.1, 1.3)                   # both options fit
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    late["classes"][travel_class]["price"] = 5 * round(cheaper * 0.6 / 5)    # cheapest of all, but late
+    tight = tight_train(rng, next(numbers), leg1, leg2)
+    trains = {t["number"]: t for t in (direct, leg1, leg2, late, tight)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub), (hub, destination)})
+
+    rules = {"objective": "cheapest"}
+    top = best_trip({"trains": trains}, make_request(group, origin, destination, deadline, travel_class, budget, **rules))
+    other = [book(leg1, travel_class, group), book(leg2, travel_class, group)] if top[0] == (direct["number"],) \
+        else [book(direct, travel_class, group)]
+    return build("cheapest_medium", "The cheapest valid trip", "medium", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains, **rules,
+                 reference=[search(origin, destination), search(origin), search(hub, destination)]
+                           + [book(trains[n], travel_class, group) for n in top[0]],
+                 traps={"the other valid option (dearer)": other,
+                        "cheapest direct, but late": [book(late, travel_class, group)],
+                        "cheaper change, but too tight": [book(leg1, travel_class, group), book(tight, travel_class, group)]})
+
+
+# ---------------------------------------------------------- value_hard
+def value_task(seed):
+    """2 travellers. A fast direct Rajdhani and a slower, cheaper connection both meet every rule.
+    The request puts a price on time, so the agent has to work out which one is better value;
+    the generator sets that price so either can win, by a clear margin."""
+    rng = random.Random(f"value_hard:{seed}")
+    stations = rng.sample(CITIES, 7)
+    origin, hub, destination = stations[0], stations[1], stations[2]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 2)
+    numbers = train_numbers(rng)
+    seats = lambda: {travel_class: len(group) + rng.randint(1, 5)}
+
+    direct = kind_train(rng, next(numbers), origin, destination, rng.randrange(420, 600, 5),
+                        rng.randrange(180, 240, 5), "Rajdhani", seats())
+    leg1 = kind_train(rng, next(numbers), origin, hub, rng.randrange(330, 420, 5), rng.randrange(120, 170, 5),
+                      "Express", seats())
+    leg2 = kind_train(rng, next(numbers), hub, destination, leg1["arrive"] + rng.randrange(40, 100, 5),
+                      rng.randrange(120, 170, 5), "Express", seats())
+    slow_fare = fare(leg1, travel_class) + fare(leg2, travel_class)
+    if fare(direct, travel_class) < slow_fare * 1.3:
+        direct["classes"][travel_class]["price"] = 5 * math.ceil(slow_fare * rng.uniform(1.3, 1.7) / 5)
+    fast_hours = (direct["arrive"] - direct["depart"]) / 60
+    slow_hours = (leg2["arrive"] - leg1["depart"]) / 60
+    breakeven = (fare(direct, travel_class) - slow_fare) / (slow_hours - fast_hours)   # Rs per hour
+    direct_wins = rng.random() < 0.5
+    time_value = max(10, 10 * round(breakeven * (rng.uniform(1.6, 2.2) if direct_wins else rng.uniform(0.3, 0.6)) / 10))
+    deadline = deadline_after(max(direct["arrive"], leg2["arrive"]))
+    budget = budget_for(rng, fare(direct, travel_class) * len(group), 1.1, 1.3)   # both options fit
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    late["classes"][travel_class]["price"] = 5 * round(slow_fare * 0.6 / 5)
+    tight = tight_train(rng, next(numbers), leg1, leg2)
+    trains = {t["number"]: t for t in (direct, leg1, leg2, late, tight)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub), (hub, destination)})
+
+    rules = {"objective": "value", "time_value": time_value}
+    top = best_trip({"trains": trains}, make_request(group, origin, destination, deadline, travel_class, budget, **rules))
+    other = [book(leg1, travel_class, group), book(leg2, travel_class, group)] if top[0] == (direct["number"],) \
+        else [book(direct, travel_class, group)]
+    return build("value_hard", "Price versus time", "hard", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains, **rules,
+                 reference=[search(origin, destination), search(origin), search(hub, destination)]
+                           + [book(trains[n], travel_class, group) for n in top[0]],
+                 traps={"the other valid option (worse value)": other,
+                        "cheapest direct, but late": [book(late, travel_class, group)],
+                        "cheaper change, but too tight": [book(leg1, travel_class, group), book(tight, travel_class, group)]})
+
+
 TASKS = {
     "direct_easy": direct_task,
     "soldout_easy": soldout_task,
@@ -417,6 +592,9 @@ TASKS = {
     "rebook_hard": rebook_task,
     "fix_connection_hard": fix_connection_task,
     "long_trip_hard": long_trip_task,
+    "facilities_medium": facilities_task,
+    "cheapest_medium": cheapest_task,
+    "value_hard": value_task,
 }
 DEMO_TASK = "direct_easy"
 
