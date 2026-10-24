@@ -104,7 +104,8 @@ def tool_book(args):
     if len(set(names)) != len(names):
         raise ValueError("a traveller is listed more than once")
     if fare["seats"] < len(names):
-        raise ValueError(f"only {fare['seats']} seats left in class {name} on train {train['number']}")
+        raise ValueError(f"only {fare['seats']} seat{'' if fare['seats'] == 1 else 's'} left in class {name} "
+                         f"on train {train['number']}")
     fare["seats"] -= len(names)
     booking = {"id": f"B{len(STATE['bookings']) + 1}", "train": train["number"], "class": name,
                "travellers": names, "status": "active", "price": fare["price"] * len(names), "fee": 0}

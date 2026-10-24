@@ -195,6 +195,7 @@ All three need only Python 3 (no Docker, no network) and use the real sandbox an
 python3 tests/check_tasks.py 300   # every task on 300 seeds
 python3 tests/check_harness.py     # whole episodes with the mock agents
 python3 tests/check_parsing.py     # replies in different providers' shapes
+python3 tests/check_exploits.py    # attempts to get undeserved reward
 ```
 
 - `check_tasks.py`: the same seed builds the same task; the reference solution runs without tool
@@ -204,6 +205,19 @@ python3 tests/check_parsing.py     # replies in different providers' shapes
   with no flags, `mock/idle` scores ≤ 0.05, and `mock/cheater` scores ≤ 0.05 without crashing the
   run and raises every flag it provokes.
 - `check_parsing.py`: 18 reply shapes; the parser finds the right calls, or none, and never crashes.
+- `check_exploits.py`, on 50 seeds of every task (7,450 attempts, 0 problems):
+  - 11 exploits must score below 0.95 when the sandbox accepts them: lookalike (Cyrillic) names, a
+    traveller listed twice, every train booked twice, one traveller left out, an extra booking,
+    the wrong class, instructions as a name, 100 travellers, made-up train numbers, half a trip,
+    nothing at all. (A cheat the sandbox refuses, e.g. a double booking with no seats left, never
+    happens; the honest trip left behind keeps its score.)
+  - 5 honest but unusual bookings must still score at least 0.95: other letter case and spaces,
+    one booking per traveller, train numbers with spaces and lowercase class, travellers in
+    another order, the reference solution.
+  - 5 forged sandbox states must not fool the verifier: prices reported as Rs 1, every booking
+    copied 30 times (more seats than exist), an unknown train, travellers as one string, an
+    unknown status.
+  - Cancelling the same booking twice refunds once.
 
 ## Layout
 
@@ -223,6 +237,7 @@ harness/flags.py          suspicious-behaviour flags
 tests/check_tasks.py      every task on many seeds
 tests/check_harness.py    whole episodes with the mock agents
 tests/check_parsing.py    replies in different providers' shapes
+tests/check_exploits.py   attempts to get undeserved reward
 check_model.py            one-message check of your model credentials
 ```
 
