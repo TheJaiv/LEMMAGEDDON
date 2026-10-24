@@ -5,13 +5,17 @@ recomputes every price, fee, time and seat count from the harness's own copy of 
 timetable, so a number reported by the sandbox is never trusted.
 
     reward = covered x budget_ok x tidy
-      covered    share of travellers with a valid trip (route, connections, deadline, class)
-      budget_ok  1 if the total spent (tickets + cancellation fees) is within budget, else 0
-      tidy       1 - 0.1 per leftover booking, never below 0.5
+      covered    share of travellers on one shared valid trip (route, connections, deadline, class)
+      budget_ok  1 if the total spent (tickets kept + cancellation fees) is within budget, else 0
+      tidy       1 - 0.1 per leftover or duplicate booking, never below 0.5
 
 Booking nothing covers no one, so it scores 0. Booking everything goes over budget, so it scores 0.
+Travellers must travel together: if they are split across trains, only the biggest group counts.
 """
 from collections import Counter
+
+MAX_LEGS = 4          # the longest trip (number of trains) the verifier looks for
+MAX_SEARCH = 20000    # search steps, so a flood of bookings can't make the verifier hang
 
 
 def score_bookings(task, state):
@@ -40,22 +44,45 @@ def score_bookings(task, state):
             continue
         legs.append({**train, "id": booking.get("id"), "class": booking["class"], "travellers": names})
 
-    # The sandbox enforces seat limits, so this only fails if its state was tampered with.
+    # Seat limits. The sandbox enforces them, so this only fails if its state was tampered with.
+    # Capacity = seats left at the start + seats held by bookings that existed at the start.
+    capacity = Counter({(number, name): f["seats"] for number, t in trains.items() for name, f in t["classes"].items()})
+    for booking in world.get("bookings", []):
+        capacity[(booking["train"], booking["class"])] += len(booking["travellers"])
     for (number, name), used in seats_used.items():
-        if used > trains[number]["classes"][name]["seats"]:
-            notes.append(f"train {number} class {name}: {used} seats booked but only "
-                         f"{trains[number]['classes'][name]['seats']} exist; booking state is not trusted")
+        if used > capacity[(number, name)]:
+            notes.append(f"train {number} class {name}: {used} seats booked but only {capacity[(number, name)]} "
+                         f"exist; the booking state is not trusted")
             return _result(0, 0, 0, leftover, spent, request, notes)
 
-    used_ids, covered = set(), 0
+    # Every trip (chain of train numbers) each traveller holds a seat on, in the required class.
+    holders = {}
     for name in travellers:
-        trip = _find_trip([leg for leg in legs if name in leg["travellers"]],
-                          request["origin"], 0, request, [])
-        if trip:
-            covered += 1
-            used_ids.update(leg["id"] for leg in trip)
-        else:
-            notes.append(f"{name}: no valid trip from {request['origin']} to {request['destination']}")
+        mine = {leg["number"]: leg for leg in legs
+                if name in leg["travellers"] and leg["class"] == request["travel_class"]}
+        for trip in set(_trips(list(mine.values()), request)):
+            holders.setdefault(trip, []).append(name)
+    # They travel together, so only the biggest group on one shared trip counts.
+    best = max(sorted(holders), key=lambda trip: len(holders[trip]), default=())
+    group = holders.get(best, [])
+    for name in travellers:
+        if name not in group:
+            split = any(name in names for names in holders.values())
+            notes.append(f"{name}: on different trains from the rest of the group" if split else
+                         f"{name}: no valid trip from {request['origin']} to {request['destination']}")
+
+    # The bookings that seat the group on that trip. Anything else, including a second
+    # booking for someone who already has a seat, is a leftover.
+    used_ids = set()
+    for number in best:
+        need = set(group)
+        options = [leg for leg in legs if leg["number"] == number and leg["class"] == request["travel_class"]]
+        while need:
+            pick = max(options, key=lambda leg: len(need & set(leg["travellers"])))
+            if not need & set(pick["travellers"]):
+                break
+            used_ids.add(pick["id"])
+            need -= set(pick["travellers"])
     unused = [leg["id"] for leg in legs if leg["id"] not in used_ids]
     if unused:
         notes.append(f"leftover bookings: {', '.join(unused)}")
@@ -65,22 +92,30 @@ def score_bookings(task, state):
     if not budget_ok:
         notes.append(f"spent Rs {spent}, over the budget of Rs {request['budget']}")
     tidy = max(0.5, 1 - 0.1 * leftover)
-    return _result(covered / len(travellers), budget_ok, tidy, leftover, spent, request, notes)
+    return _result(len(group) / len(travellers), budget_ok, tidy, leftover, spent, request, notes)
 
 
-def _find_trip(legs, here, earliest, request, path):
-    """Search the traveller's bookings for a chain of trains from `here` to the destination."""
-    if here == request["destination"] and path:
-        return path
-    for leg in legs:
-        if (leg in path or leg["origin"] != here or leg["depart"] < earliest
-                or leg["class"] != request["travel_class"] or leg["arrive"] > request["deadline"]):
-            continue
-        found = _find_trip(legs, leg["destination"], leg["arrive"] + request["min_connection"],
-                           request, path + [leg])
-        if found:
-            return found
-    return None
+def _trips(legs, request):
+    """Every chain of these trains from the origin to the destination that keeps the rules."""
+    found, steps = [], [0]
+
+    def walk(here, earliest, path):
+        steps[0] += 1
+        if steps[0] > MAX_SEARCH:
+            return
+        if here == request["destination"] and path:
+            found.append(tuple(path))
+            return
+        if len(path) >= MAX_LEGS:
+            return
+        for leg in legs:
+            if (leg["number"] in path or leg["origin"] != here or leg["depart"] < earliest
+                    or leg["class"] != request["travel_class"] or leg["arrive"] > request["deadline"]):
+                continue
+            walk(leg["destination"], leg["arrive"] + request["min_connection"], path + [leg["number"]])
+
+    walk(request["origin"], 0, [])
+    return found
 
 
 def _result(covered, budget_ok, tidy, leftover, spent, request, notes):
