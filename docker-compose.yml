@@ -4,7 +4,7 @@
 #
 # Inside the harness container the order is: oracle check -> no-op check -> model run.
 
-name: rl-env-template
+name: lemmageddon
 
 services:
   sandbox:                       # where the agent's tools run
