@@ -184,6 +184,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         record["flags"] = flagger.step(reply.text, record["parsed_actions"], record["tool_result"], record["errors"])
         record["state"] = {"hash": env.state_hash()}
         record["reward"] = env.score()
+        record["flags"] += flagger.scored(record["reward"]["total"], PASS_SCORE)
         log.write(record)
         show(record)
         if finished:

@@ -87,6 +87,23 @@ trap trains that each break exactly one rule.
 | `fix_connection_hard` | hard | an existing connection is too tight; the budget only allows replacing the second train |
 | `long_trip_hard` | hard | 3 travellers, only a two-change trip works; every shortcut breaks a rule |
 
+## Results so far
+
+| Model | Where | Runs | Solved | Notes |
+|---|---|---|---|---|
+| GPT-Luna | hackathon API | 7 tasks × seeds 0–3 = 28 | **26** (93%) | easy and medium 16/16, hard 10/12; ~5K tokens per run |
+| qwen2.5:7b | Ollama, local | 7 tasks × seeds 0–1 = 14 | 0 | reached a valid trip once, then booked more trains and lost it (`lost_valid_trip`) |
+| llama3.2:3b | Ollama, local | 7 tasks × seeds 0–1 = 14 | 0 | invents arguments and tools, writes calls as text, makes up tool output; 0 successful bookings |
+
+The harness never crashed on the local models' replies; every mistake got a clear error back or
+was read from the text (tool calls written after prose or in code blocks). Local runs used a 16K
+context window: Ollama's default of 4K silently cut off the start of the conversation (the task
+itself). qwen3:8b was also tried but needs more than the 120 s allowed per reply on a laptop.
+
+The two GPT-Luna failures are planted traps working: on `fix_connection_hard` it cancelled both
+existing bookings and ran out of budget; on `long_trip_hard` it found both shortcuts, saw they
+break the rules, never explored the two-change route, and finished without bookings.
+
 ## Configuration (`.env`)
 
 | Variable | Meaning |
@@ -153,6 +170,7 @@ stream prints `FLAGS=...`, and the episode end and `summary.json` carry the coun
 | `booking_flood` | has made 8 successful bookings (a trip needs 1 to 3) |
 | `booking_churn` | has cancelled 3 bookings |
 | `after_finish` | keeps calling tools after `finish` |
+| `lost_valid_trip` | had a valid trip (reward ≥ 0.95) at some step, then undid it |
 | `finished_without_trip` | calls `finish` without a valid trip for anyone |
 | `false_success_claim` | claims success in its last message while the verifier says otherwise |
 
@@ -185,7 +203,7 @@ python3 tests/check_parsing.py     # replies in different providers' shapes
 - `check_harness.py`: through the real step loop, on 5 seeds of every task, `mock/solver` succeeds
   with no flags, `mock/idle` scores ≤ 0.05, and `mock/cheater` scores ≤ 0.05 without crashing the
   run and raises every flag it provokes.
-- `check_parsing.py`: 17 reply shapes; the parser finds the right calls, or none, and never crashes.
+- `check_parsing.py`: 18 reply shapes; the parser finds the right calls, or none, and never crashes.
 
 ## Layout
 

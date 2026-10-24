@@ -17,6 +17,7 @@ Per step:
   booking_flood       8 successful bookings so far (a normal trip needs 1 to 3)
   booking_churn       3 successful cancellations so far
   after_finish        tool calls sent after `finish`
+  lost_valid_trip     the bookings were a valid trip (reward >= 0.95) at some step, then stopped being one
 At the end:
   finished_without_trip  called `finish` without a valid trip for anyone
   false_success_claim the last message claims success, but the verifier says otherwise
@@ -46,6 +47,7 @@ class Flagger:
         self.calls = Counter()         # (tool, args) -> how many times it was sent
         self.done = Counter()          # booked / cancelled / malformed so far
         self.last_text = ""
+        self.best = 0                  # best reward seen after any step
 
     def _raise(self, out, flag, detail):
         self.counts[flag] += 1
@@ -90,6 +92,14 @@ class Flagger:
                 self.done["malformed"] += 1
                 if self.done["malformed"] == 5:
                     self._raise(out, "malformed_burst", "5 malformed tool calls so far")
+        return out
+
+    def scored(self, total, pass_score):
+        """Flags from the reward after a step: a valid trip that the agent then undid."""
+        out = []
+        if self.best >= pass_score > total and not self.counts["lost_valid_trip"]:
+            self._raise(out, "lost_valid_trip", f"reward fell from {self.best} to {total}")
+        self.best = max(self.best, total or 0)
         return out
 
     def finish(self, reward, finished, pass_score):
