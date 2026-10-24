@@ -63,6 +63,7 @@ class OpenAIClient:
 
 # ------------------------------------------------------- reading replies
 TEXT_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>|```(?:json)?\s*(.*?)```", re.S)
+JSON_START = re.compile(r"[\[{]")
 
 
 def reply_from_response(response):
@@ -72,7 +73,8 @@ def reply_from_response(response):
     of a string, missing call ids, names with stray spaces, the older single `function_call`
     field, content sent as a list of parts, and a response with no `choices` at all. Only when
     there is no structured tool call, it also reads tool calls written into the text:
-    <tool_call>{...}</tool_call>, a ```json block, or a reply that is just a JSON object or list.
+    <tool_call>{...}</tool_call>, a ```json block, or a JSON object or list anywhere in the text,
+    for example after a sentence of prose.
     """
     raw, choices = _dump(response), _get(response, "choices") or []
     usage = _get(response, "usage")
@@ -94,13 +96,17 @@ def reply_from_response(response):
 
 def calls_from_text(text):
     """Tool calls written into the reply text by models that don't use the tool_calls field."""
-    chunks = [a or b for a, b in TEXT_CALL.findall(text)] or [text.strip()]
-    calls = []
+    chunks = [a or b for a, b in TEXT_CALL.findall(text)]
+    values = []
     for chunk in chunks:
         try:
-            data = json.loads(chunk)
+            values.append(json.loads(chunk))
         except json.JSONDecodeError:
             continue
+    if not chunks:
+        values = _json_values(text)
+    calls = []
+    for data in values:
         for item in data if isinstance(data, list) else [data]:
             if not isinstance(item, dict):
                 continue
@@ -112,6 +118,18 @@ def calls_from_text(text):
             args = next((item[k] for k in ("arguments", "args", "parameters", "input") if k in item), {})
             calls.append(ToolCall(f"text_call_{len(calls)}", name.strip(), _arguments(args), source="text"))
     return calls
+
+
+def _json_values(text):
+    """Every JSON object or list in the text, wherever it starts (e.g. after some prose)."""
+    decoder, values, at = json.JSONDecoder(), [], 0
+    while (match := JSON_START.search(text, at)):
+        try:
+            value, at = decoder.raw_decode(text, match.start())
+            values.append(value)
+        except json.JSONDecodeError:
+            at = match.start() + 1
+    return values
 
 
 def _get(obj, key):

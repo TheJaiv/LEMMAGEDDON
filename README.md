@@ -185,7 +185,7 @@ python3 tests/check_parsing.py     # replies in different providers' shapes
 - `check_harness.py`: through the real step loop, on 5 seeds of every task, `mock/solver` succeeds
   with no flags, `mock/idle` scores ≤ 0.05, and `mock/cheater` scores ≤ 0.05 without crashing the
   run and raises every flag it provokes.
-- `check_parsing.py`: 14 reply shapes; the parser finds the right calls, or none, and never crashes.
+- `check_parsing.py`: 17 reply shapes; the parser finds the right calls, or none, and never crashes.
 
 ## Layout
 
