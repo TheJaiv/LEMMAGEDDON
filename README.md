@@ -98,7 +98,7 @@ dear, pantry, 2–4 stops), Superfast, Express, and Passenger (slow, cheap, no p
 
 | Model | Where | Runs | Solved | Notes |
 |---|---|---|---|---|
-| GPT-Luna | hackathon API | 7 tasks × seeds 0–3 = 28 | **26** (93%) | easy and medium 16/16, hard 10/12; ~5K tokens per run |
+| GPT-Luna | hackathon API | 10 tasks, 44 runs (seeds 0–3; `value_hard` also seeds 4, 5, 6, 8) | **40** (91%) | easy 8/8, medium 15/16, hard 17/20; two of the four misses scored 0.6 (a valid but worse choice) |
 | qwen2.5:7b | Ollama, local | 7 tasks × seeds 0–1 = 14 | 0 | reached a valid trip once, then booked more trains and lost it (`lost_valid_trip`) |
 | llama3.2:3b | Ollama, local | 7 tasks × seeds 0–1 = 14 | 0 | invents arguments and tools, writes calls as text, makes up tool output; 0 successful bookings |
 
@@ -107,7 +107,7 @@ was read from the text (tool calls written after prose or in code blocks). Local
 context window: Ollama's default of 4K silently cut off the start of the conversation (the task
 itself). qwen3:8b was also tried but needs more than the 120 s allowed per reply on a laptop.
 
-The two GPT-Luna failures are planted traps working: on `fix_connection_hard` it cancelled both
+Its misses are planted traps working. Two scored partial credit (0.6): on `cheapest_medium` it booked the first direct train that fit and never looked at connections; on `value_hard` it chose the fast train when the slow connection was the better value. The other two: on `fix_connection_hard` it cancelled both
 existing bookings and ran out of budget; on `long_trip_hard` it found both shortcuts, saw they
 break the rules, never explored the two-change route, and finished without bookings.
 
