@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .env import PASS_SCORE
+from .flags import Flagger
 from .tools import SPECS, TOOLS, TOOL_NAMES, check_args
 
 SYSTEM_PROMPT = (
@@ -45,9 +46,10 @@ def show(record):
     """One readable line per step on the terminal (live telemetry)."""
     tools = ",".join(a.get("tool", "?") for a in record["parsed_actions"]) or "-"
     reward = record["reward"].get("total") if record.get("reward") else None
+    flags = ",".join(sorted({f["flag"] for f in record.get("flags", [])}))
     print(f"[{record['agent']:<6} step {record['step']:>2}] tools={tools:<40} "
           f"reward={reward if reward is not None else '-':<6} state={record['state']['hash']} "
-          f"errors={len(record['errors'])}", flush=True)
+          f"errors={len(record['errors'])}" + (f"  FLAGS={flags}" if flags else ""), flush=True)
 
 
 # --------------------------------------------------------- context trimming
@@ -109,6 +111,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
     system = SYSTEM_PROMPT + (("\n\n" + append_text) if append_text else "")
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     started, termination, finished, steps = None, None, False, 0
+    flagger = Flagger(TOOL_NAMES)
 
     for step in range(1, limits.max_steps + 1):
         if started is not None and time.monotonic() - started >= limits.max_seconds:
@@ -123,7 +126,8 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         steps = step
         record = {"timestamp": now(), "agent": "model", "task": task_id, "step": step, "seed": seed,
                   "model_input": sent, "model_output_raw": None, "parsed_actions": [], "tool_result": [],
-                  "errors": [], "state": {"hash": env.state_hash()}, "reward": None, "tokens": 0, "latency_ms": 0}
+                  "errors": [], "flags": [], "state": {"hash": env.state_hash()}, "reward": None,
+                  "tokens": 0, "latency_ms": 0}
 
         try:
             reply = client.complete(sent, TOOLS, timeout=max(5, min(120, remaining)))
@@ -151,7 +155,8 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
 
         for index, call in enumerate(reply.tool_calls):
             args, parse_error = call.parse()
-            record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error})
+            record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error,
+                                             "source": call.source})
             if finished:
                 result = "not run: the episode already finished"
             elif index >= limits.max_tool_calls:
@@ -176,6 +181,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             record["tool_result"].append(result)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
+        record["flags"] = flagger.step(reply.text, record["parsed_actions"], record["tool_result"], record["errors"])
         record["state"] = {"hash": env.state_hash()}
         record["reward"] = env.score()
         log.write(record)
@@ -192,8 +198,10 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         termination = termination or "crash"
     if termination is None:
         termination = "success" if (final["total"] or 0) >= PASS_SCORE else "failure"
+    end_flags = flagger.finish(final, finished, PASS_SCORE)
     log.write({"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end", "seed": seed,
-               "steps": steps, "termination": termination, "reward": final,
+               "steps": steps, "termination": termination, "reward": final, "flags": end_flags,
+               "flag_counts": dict(flagger.counts),
                "elapsed_s": round(time.monotonic() - started, 1) if started else 0})
-    return {"termination": termination, "steps": steps, "reward": final,
+    return {"termination": termination, "steps": steps, "reward": final, "flags": dict(flagger.counts),
             "elapsed_s": round(time.monotonic() - started, 1) if started else 0}

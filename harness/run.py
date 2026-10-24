@@ -203,6 +203,7 @@ def run_model(env, task_id, seed, client, model, append_text, limits, log_path):
         log.close()
     print(f"\ntermination: {result['termination']}   reward: {result['reward']}   steps: {result['steps']}",
           flush=True)
+    print(f"suspicious-behaviour flags: {result['flags'] or 'none'}", flush=True)
     return result
 
 
