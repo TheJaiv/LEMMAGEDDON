@@ -147,6 +147,7 @@ Exit codes: `0` finished, `1` crash, `2` a baseline check failed, `3` bad config
 | Steps | 40 (one step = one model reply) |
 | Time | 10 minutes from the first model request |
 | Tool calls per reply | 10 (extra calls are not run and get an error back) |
+| Time per tool call | 60 seconds; a timeout returns an error to the agent and the episode continues |
 | Tool output | 4,000 characters |
 | Context | old tool outputs trimmed to keep the conversation under about 48K tokens |
 
