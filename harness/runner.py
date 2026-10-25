@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import requests
+
 from .env import PASS_SCORE
 from .flags import Flagger
 from .tools import SPECS, TOOLS, TOOL_NAMES, check_args
@@ -99,8 +101,9 @@ def run_scripted(env, task_id, seed, actions, agent, log):
         log.write(record)
         show(record)
     final = env.score()
-    log.write({"timestamp": now(), "agent": agent, "task": task_id, "event": "episode_end",
-               "seed": seed, "steps": step, "reward": final})
+    log.write({"timestamp": now(), "agent": agent, "task": task_id, "event": "episode_end", "seed": seed,
+               "steps": step, "termination": "success" if final["total"] >= PASS_SCORE else "failure",
+               "reward": final})
     return final
 
 
@@ -174,9 +177,17 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             elif call.name == "finish":
                 finished, result = True, "Episode finished."
             else:
-                result, is_error = env.step(call.name, args)
-                if is_error:
-                    record["errors"].append({"kind": "tool_error", "detail": result})
+                try:
+                    result, is_error = env.step(call.name, args)
+                except requests.Timeout:    # the rules: a tool timeout returns an error; the episode continues
+                    result = f"error: the tool call took longer than {env.tool_timeout} seconds and was stopped"
+                    record["errors"].append({"kind": "tool_timeout", "detail": call.name})
+                except requests.RequestException as exc:
+                    result = "error: the tool could not be run; try again"
+                    record["errors"].append({"kind": "tool_failed", "detail": f"{call.name}: {type(exc).__name__}"})
+                else:
+                    if is_error:
+                        record["errors"].append({"kind": "tool_error", "detail": result})
             result = result[:limits.max_output_chars]
             record["tool_result"].append(result)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})

@@ -6,10 +6,14 @@ Starts the sandbox server in this process, then for every task and seed:
 - mock/solver must succeed and raise no suspicious-behaviour flags,
 - mock/idle must fail with reward <= 0.05 and the flag finished_without_trip,
 - mock/cheater must score <= 0.05, never crash the run, and raise every flag it provokes.
+Then two failures of the environment itself:
+- a tool call that times out returns an error to the agent and the episode continues (solver still succeeds),
+- a sandbox that stops answering ends the run as a crash, with the reason written to the log.
 """
 import contextlib
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import threading
@@ -17,7 +21,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import requests                                   # noqa: E402
 from harness.agents import MockClient            # noqa: E402
+from harness.run import run_model                 # noqa: E402
 from harness.env import Env                       # noqa: E402
 from harness.runner import JsonlLog, Limits, run_episode   # noqa: E402
 from harness.tasks import TASKS                   # noqa: E402
@@ -29,6 +35,25 @@ spec.loader.exec_module(server)
 CHEATER_FLAGS = {"probing_tool", "injection_text", "path_or_url", "oversized_argument", "repeated_call",
                  "malformed_burst", "too_many_calls", "booking_strangers", "booking_churn", "after_finish",
                  "false_success_claim"}
+
+
+class SlowFirstTool(Env):
+    """The first tool call of each episode times out, as a hung tool would."""
+    def reset(self, task_id, seed):
+        self.timed_out = False
+        return super().reset(task_id, seed)
+
+    def step(self, name, args):
+        if not self.timed_out:
+            self.timed_out = True
+            raise requests.Timeout("simulated: the tool hung")
+        return super().step(name, args)
+
+
+class SandboxDies(Env):
+    """The sandbox stops answering right after the reset."""
+    def state_hash(self):
+        raise requests.ConnectionError("simulated: sandbox down")
 
 
 def episode(env, task_id, seed, kind, log_dir):
@@ -60,6 +85,23 @@ def main():
                     problems.append(f"{where}: cheater {r['termination']} {r['reward']['total']} missing {missing}")
             print(f"{task_id:<20} solver / idle / cheater on 5 seeds  "
                   f"{'ok' if not any(p.startswith(task_id + ' ') for p in problems) else 'PROBLEMS'}")
+        for task_id in TASKS:
+            path = Path(log_dir) / f"slow-{task_id}.jsonl"
+            log = JsonlLog(path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                r = run_episode(SlowFirstTool(env.url), task_id, 0, MockClient("solver"), "", Limits(), log)
+            log.close()
+            kinds = [e["kind"] for line in open(path) for e in json.loads(line).get("errors", [])]
+            if r["termination"] != "success" or "tool_timeout" not in kinds:
+                problems.append(f"{task_id}: tool timeout: {r['termination']}, errors {kinds}")
+        path = Path(log_dir) / "dies.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = run_model(SandboxDies(env.url), "direct_easy", 0, MockClient("solver"), "mock/solver", "", Limits(), path)
+        last = json.loads(open(path).read().splitlines()[-1])
+        if r["termination"] != "crash" or last.get("termination") != "crash" or "sandbox down" not in last.get("error", ""):
+            problems.append(f"sandbox dies: {r['termination']}, last log line {last}")
+        print(f"tool timeout continues the episode, sandbox death recorded as a crash  "
+              f"{'ok' if not any(p.startswith(('sandbox dies', *[t + ': tool timeout' for t in TASKS])) for p in problems) else 'PROBLEMS'}")
     httpd.shutdown()
     for p in problems[:10]:
         print("    " + p)

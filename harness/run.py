@@ -199,6 +199,12 @@ def run_model(env, task_id, seed, client, model, append_text, limits, log_path):
     log = JsonlLog(log_path)
     try:
         result = run_episode(env, task_id, seed, client, append_text, limits, log)
+    except Exception as exc:    # e.g. the sandbox stopped answering: record the crash and its reason
+        error = f"{type(exc).__name__}: {exc}"
+        result = {"termination": "crash", "steps": None, "reward": {"total": None}, "flags": {},
+                  "elapsed_s": None, "error": error}
+        log.write({"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end", "seed": seed,
+                   "termination": "crash", "error": error, "reward": result["reward"]})
     finally:
         log.close()
     print(f"\ntermination: {result['termination']}   reward: {result['reward']}   steps: {result['steps']}",
