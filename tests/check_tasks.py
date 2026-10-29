@@ -5,7 +5,8 @@
 
 For every task and seed: the same seed builds the same task, the reference solution runs
 without tool errors and scores >= 0.95, doing nothing scores <= 0.05, every trap the task
-lists scores < 0.95, and every train runs within one day. Actions go through the real
+lists scores < 0.95, and every train runs within one day. The reference solution scored by a
+verifier that has run out of time scores 0. Actions go through the real
 sandbox tool code (imported directly, no HTTP) and the real verifier.
 """
 import importlib.util
@@ -42,6 +43,9 @@ def check(task_id, seed):
     reward, errors = play(task, task.reference)
     if reward["total"] < 0.95 or errors:
         problems.append(f"reference scored {reward['total']} {errors or reward['notes']}")
+    late = score_bookings(task, json.loads(json.dumps(server.do_state())), seconds=0)
+    if late["total"] != 0 or "verifier_timeout" not in " ".join(late["notes"]):
+        problems.append(f"the reference scored {late['total']} by a verifier out of time")
     reward, _ = play(task, [])
     if reward["total"] > 0.05:
         problems.append(f"no-op scored {reward['total']}")

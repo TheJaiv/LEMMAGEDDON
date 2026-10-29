@@ -13,7 +13,7 @@ import math
 import random
 from dataclasses import dataclass, field
 
-from .verifier import best_trip
+from .verifier import best_trip, valid_trips
 
 CITIES = ["Mumbai", "Pune", "Nashik", "Surat", "Vadodara", "Ahmedabad", "Nagpur", "Indore",
           "Bhopal", "Jaipur", "Delhi", "Agra", "Lucknow", "Hyderabad", "Bengaluru", "Chennai"]
@@ -43,8 +43,8 @@ def hhmm(minutes):
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-def train_numbers(rng):
-    return iter(str(n) for n in rng.sample(range(11001, 22999), 20))
+def train_numbers(rng, count=20):
+    return iter(str(n) for n in rng.sample(range(11001, 22999), count))
 
 
 def make_train(rng, number, origin, destination, depart, duration, classes, seats=None, kind="Express",
@@ -170,6 +170,9 @@ def extra_rules(request):
         lines.append("Every train must have a pantry car (meals on board).")
     if request.get("max_stops") is not None:
         lines.append(f"Every train may make at most {request['max_stops']} stops on the way.")
+    if request.get("disruptions"):
+        lines.append("Trains can be cancelled by the railway at short notice. A booking on a cancelled train is "
+                     "refunded in full but gives no one a seat. Check your bookings before you finish.")
     if request.get("objective") == "cheapest":
         lines.append("Several trips may meet every rule: book the one with the lowest total ticket price.")
     if request.get("objective") == "value":
@@ -584,6 +587,169 @@ def value_task(seed):
                         "cheaper change, but too tight": [book(leg1, travel_class, group), book(tight, travel_class, group)]})
 
 
+# -------------------------------------------------------- disruption_hard
+REASONS = ["signal failure", "flooding near the track", "a landslide on the line", "a locomotive breakdown"]
+
+
+def disruption_task(seed):
+    """3 travellers. Right after the first booking, the railway cancels the obvious train: a cheap
+    direct one that is on time. The agent has to notice the alert and rebook a connection; every
+    other shortcut breaks a rule (late, a change that is too tight, over budget)."""
+    rng = random.Random(f"disruption_hard:{seed}")
+    stations = rng.sample(CITIES, 7)
+    origin, hub, destination = stations[0], stations[1], stations[2]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 3)
+    numbers = train_numbers(rng)
+
+    leg1, leg2 = plant_connection(rng, numbers, origin, hub, destination, travel_class, group)
+    deadline = deadline_after(leg2["arrive"])
+    slow_fare = fare(leg1, travel_class) + fare(leg2, travel_class)
+    budget = budget_for(rng, slow_fare * len(group), 1.05, 1.2)
+
+    def direct(kind, seats=None):
+        """A direct train that arrives on time."""
+        arrive = deadline - rng.randrange(15, 60, 5)
+        duration = min(rng.randrange(180, 300, 5), arrive - 300)
+        return make_train(rng, next(numbers), origin, destination, arrive - duration, duration, list(CLASSES),
+                          seats=seats, kind=kind)
+    doomed = direct("Superfast", {travel_class: len(group) + rng.randint(2, 6)})   # cancelled after booking
+    doomed["classes"][travel_class]["price"] = 5 * round(slow_fare * rng.uniform(0.6, 0.85) / 5)
+    pricey = direct("Rajdhani", {travel_class: len(group) + rng.randint(2, 6)})    # on time, over budget
+    pricey["classes"][travel_class]["price"] = 5 * math.ceil(budget * rng.uniform(1.15, 1.4) / len(group) / 5)
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    late["classes"][travel_class]["price"] = 5 * round(slow_fare * 0.5 / 5)
+    tight = tight_train(rng, next(numbers), leg1, leg2)
+    trains = {t["number"]: t for t in (leg1, leg2, doomed, pricey, late, tight)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub), (hub, destination)})
+
+    task = build("disruption_hard", "A train cancelled after booking", "hard", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains, disruptions=True,
+                 reference=[search(origin, destination), book(doomed, travel_class, group), ("list_bookings", {}),
+                            search(origin, hub), search(hub, destination),
+                            book(leg1, travel_class, group), book(leg2, travel_class, group)],
+                 traps={"book the direct train and finish": [book(doomed, travel_class, group)],
+                        "direct but late": [book(late, travel_class, group)],
+                        "change too tight": [book(leg1, travel_class, group), book(tight, travel_class, group)],
+                        "fast direct, over budget": [book(pricey, travel_class, group)]})
+    task.world["disruption"] = {"train": doomed["number"], "reason": rng.choice(REASONS)}
+    return task
+
+
+# -------------------------------------------------------- join_group_hard
+def join_group_task(seed):
+    """Two travellers hold the last seats on a first train; a third joins them. The group must
+    travel together, so all three move to trains with seats for three. The budget pays for the
+    cancellation fee, but not for keeping the old booking as well."""
+    rng = random.Random(f"join_group_hard:{seed}")
+    stations = rng.sample(CITIES, 7)
+    origin, hub, destination = stations[0], stations[1], stations[2]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 3)
+    pair = group[:2]
+    numbers = train_numbers(rng)
+    seats = lambda: {travel_class: len(group) + rng.randint(0, 3)}
+
+    held = make_train(rng, next(numbers), origin, hub, rng.randrange(330, 450, 5), rng.randrange(120, 200, 5),
+                      list(CLASSES), seats={travel_class: 0})          # the pair hold its last seats
+    move = make_train(rng, next(numbers), origin, hub, held["depart"] + rng.randrange(30, 120, 5),
+                      rng.randrange(120, 200, 5), list(CLASSES), seats=seats())
+    leg2 = make_train(rng, next(numbers), hub, destination,
+                      max(held["arrive"], move["arrive"]) + rng.randrange(40, 100, 5),
+                      rng.randrange(120, 240, 5), list(CLASSES), seats=seats())
+    deadline = deadline_after(leg2["arrive"])
+    # a second train that only connects with the held one, with 2 seats: enough for the pair alone
+    depart = held["arrive"] + rng.randrange(40, 80, 5)
+    small = make_train(rng, next(numbers), hub, destination, depart,
+                       min(rng.randrange(120, 240, 5), deadline - 10 - depart), list(CLASSES), seats={travel_class: 2})
+    tight = tight_train(rng, next(numbers), move, leg2)
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    existing = {"id": "B1", "train": held["number"], "class": travel_class, "travellers": list(pair),
+                "status": "active", "price": fare(held, travel_class) * len(pair), "fee": 0}
+    fee = round(existing["price"] * CANCEL_FEE)
+    budget = budget_for(rng, fee + (fare(move, travel_class) + fare(leg2, travel_class)) * len(group), 1.05, 1.15)
+    trains = {t["number"]: t for t in (held, move, leg2, small, tight, late)}
+    add_noise(rng, trains, numbers, stations, count=8,
+              avoid={(origin, destination), (origin, hub), (hub, destination)})
+
+    cancel = ("cancel", {"booking_id": "B1"})
+    return build("join_group_hard", "A third traveller joins", "hard", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains, bookings=[existing],
+                 reference=[("list_bookings", {}), search(origin, hub),
+                            ("check_seats", {"train": held["number"], "class": travel_class}), cancel,
+                            book(move, travel_class, group), search(hub, destination), book(leg2, travel_class, group)],
+                 traps={"keep the pair, newcomer on another first train": [book(move, travel_class, group[2:]),
+                                                                          book(leg2, travel_class, group)],
+                        "the pair on a 2-seat second train, newcomer left out": [book(small, travel_class, pair)],
+                        "move everyone but keep the old booking": [book(move, travel_class, group),
+                                                                   book(leg2, travel_class, group)],
+                        "change too tight": [cancel, book(move, travel_class, group), book(tight, travel_class, group)],
+                        "direct but late": [cancel, book(late, travel_class, group)]})
+
+
+# ----------------------------------------------------------- network_hard
+def network_task(seed):
+    """A big timetable: 14 stations, about 50 trains, 4 travellers. Only trips with two changes
+    work: the direct trains are late or over budget, and every one-change trip is too tight or
+    short of seats for four. Noise trains that would open a shortcut are removed."""
+    rng = random.Random(f"network_hard:{seed}")
+    stations = rng.sample(CITIES, 14)
+    origin, hub1, hub2, destination = stations[:4]
+    travel_class = rng.choice(list(CLASSES))
+    group = rng.sample(NAMES, 4)
+    numbers = train_numbers(rng, 80)
+    seats = lambda: {travel_class: len(group) + rng.randint(0, 3)}
+
+    leg1 = make_train(rng, next(numbers), origin, hub1, rng.randrange(300, 480, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    leg2 = make_train(rng, next(numbers), hub1, hub2, leg1["arrive"] + rng.randrange(40, 90, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    leg3 = make_train(rng, next(numbers), hub2, destination, leg2["arrive"] + rng.randrange(40, 90, 5),
+                      rng.randrange(90, 180, 5), list(CLASSES), seats=seats())
+    deadline = deadline_after(leg3["arrive"])
+    budget = budget_for(rng, sum(fare(t, travel_class) for t in (leg1, leg2, leg3)) * len(group), 1.1, 1.25)
+
+    late = late_train(rng, next(numbers), origin, destination, deadline)
+    arrive = deadline - rng.randrange(10, 60, 5)
+    duration = min(rng.randrange(180, 300, 5), arrive - 300)
+    pricey = make_train(rng, next(numbers), origin, destination, arrive - duration, duration, list(CLASSES),
+                        seats={travel_class: len(group) + rng.randint(1, 4)}, kind="Rajdhani")
+    pricey["classes"][travel_class]["price"] = 5 * math.ceil(budget * rng.uniform(1.15, 1.4) / len(group) / 5)
+    # via hub1: on time, but one seat short for the group
+    depart = leg1["arrive"] + rng.randrange(40, 90, 5)
+    short = make_train(rng, next(numbers), hub1, destination, depart,
+                       min(rng.randrange(120, 240, 5), deadline - 10 - depart), list(CLASSES),
+                       seats={travel_class: len(group) - 1})
+    # via hub2: arrives 5-20 minutes before leg3 leaves, too tight to change
+    arrive = leg3["depart"] - rng.randrange(5, 25, 5)
+    duration = min(rng.randrange(150, 300, 5), arrive - 300)
+    tight = make_train(rng, next(numbers), origin, hub2, arrive - duration, duration, list(CLASSES))
+    trains = {t["number"]: t for t in (leg1, leg2, leg3, late, pricey, short, tight)}
+    planted = set(trains)
+    add_noise(rng, trains, numbers, stations, count=42,
+              avoid={(origin, destination), (origin, hub1), (hub1, hub2), (hub2, destination),
+                     (hub1, destination), (origin, hub2)})
+    request = make_request(group, origin, destination, deadline, travel_class, budget)
+    while (shortcut := next((t for t in valid_trips({"trains": trains}, request) if len(t) < 3), None)):
+        noise = [number for number in shortcut if number not in planted]
+        assert noise, f"planted trains alone make the shortcut {shortcut}"
+        del trains[noise[0]]
+
+    return build("network_hard", "A big timetable for a group of four", "hard", group, origin, destination,
+                 deadline, travel_class, budget, stations, trains,
+                 reference=[search(origin), search(hub1), search(hub2, destination),
+                            book(leg1, travel_class, group), book(leg2, travel_class, group),
+                            book(leg3, travel_class, group)],
+                 traps={"direct but late": [book(late, travel_class, group)],
+                        "fast direct, over budget": [book(pricey, travel_class, group)],
+                        "three of four on the 3-seat train": [book(leg1, travel_class, group),
+                                                             book(short, travel_class, group[:3])],
+                        "change too tight at the second hub": [book(tight, travel_class, group),
+                                                               book(leg3, travel_class, group)],
+                        "first two trains only": [book(leg1, travel_class, group), book(leg2, travel_class, group)]})
+
+
 TASKS = {
     "direct_easy": direct_task,
     "soldout_easy": soldout_task,
@@ -595,6 +761,9 @@ TASKS = {
     "facilities_medium": facilities_task,
     "cheapest_medium": cheapest_task,
     "value_hard": value_task,
+    "disruption_hard": disruption_task,
+    "join_group_hard": join_group_task,
+    "network_hard": network_task,
 }
 DEMO_TASK = "direct_easy"
 

@@ -81,7 +81,7 @@ class Flagger:
                 self._raise(out, "after_finish", name)
             for kind, prefix, limit, flag in (("booked", "Booked ", 8, "booking_flood"),
                                               ("cancelled", "Cancelled ", 3, "booking_churn")):
-                if result.startswith(prefix):
+                if any(line.startswith(prefix) for line in result.splitlines()):   # after any alert
                     self.done[kind] += 1
                     if self.done[kind] == limit:
                         self._raise(out, flag, f"{limit} {kind} so far")

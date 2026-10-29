@@ -6,6 +6,7 @@ Starts the sandbox server in this process, then for every task and seed:
 - mock/solver must succeed and raise no suspicious-behaviour flags,
 - mock/idle must fail with reward <= 0.05 and the flag finished_without_trip,
 - mock/cheater must score <= 0.05, never crash the run, and raise every flag it provokes.
+Then an empty model reply: the history sent back holds a placeholder, never an empty assistant message.
 Then two failures of the environment itself:
 - a tool call that times out returns an error to the agent and the episode continues (solver still succeeds),
 - a sandbox that stops answering ends the run as a crash, with the reason written to the log.
@@ -22,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import requests                                   # noqa: E402
-from harness.agents import MockClient            # noqa: E402
+from harness.agents import MockClient, Reply     # noqa: E402
 from harness.run import run_model                 # noqa: E402
 from harness.env import Env                       # noqa: E402
 from harness.runner import JsonlLog, Limits, run_episode   # noqa: E402
@@ -54,6 +55,19 @@ class SandboxDies(Env):
     """The sandbox stops answering right after the reset."""
     def state_hash(self):
         raise requests.ConnectionError("simulated: sandbox down")
+
+
+class EmptyThenSolve(MockClient):
+    """The first reply is empty (no text, no tool call); then it plays the solver. Keeps what it was sent."""
+    def __init__(self):
+        super().__init__("solver")
+        self.sent = []
+
+    def complete(self, messages, tools, timeout):
+        self.sent.append(messages)
+        if len(self.sent) == 1:
+            return Reply(text="", tool_calls=[], raw="")
+        return super().complete(messages, tools, timeout)
 
 
 def episode(env, task_id, seed, kind, log_dir):
@@ -94,6 +108,15 @@ def main():
             kinds = [e["kind"] for line in open(path) for e in json.loads(line).get("errors", [])]
             if r["termination"] != "success" or "tool_timeout" not in kinds:
                 problems.append(f"{task_id}: tool timeout: {r['termination']}, errors {kinds}")
+        client = EmptyThenSolve()
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = run_episode(env, "direct_easy", 0, client, "", Limits(), JsonlLog(Path(log_dir) / "empty.jsonl"))
+        empty = [m for m in client.sent[1] if m["role"] == "assistant" and not (m.get("content") or "").strip()
+                 and not m.get("tool_calls")]
+        if r["termination"] != "success" or empty:
+            problems.append(f"empty reply: {r['termination']}, empty assistant messages sent {empty}")
+        print(f"empty reply replaced by a placeholder in the history  "
+              f"{'ok' if not any(p.startswith('empty reply') for p in problems) else 'PROBLEMS'}")
         path = Path(log_dir) / "dies.jsonl"
         with contextlib.redirect_stdout(io.StringIO()):
             r = run_model(SandboxDies(env.url), "direct_easy", 0, MockClient("solver"), "mock/solver", "", Limits(), path)

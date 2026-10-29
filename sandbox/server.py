@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_OUTPUT = 4000          # characters returned to the agent per tool call
 
-STATE = {"world": None, "bookings": []}
+STATE = {"world": None, "bookings": [], "alerts": []}   # alerts: news for the agent's next tool call
 LOCK = threading.Lock()    # one request at a time reads or changes the state
 
 
@@ -45,6 +45,8 @@ def find_train(number):
     train = world()["trains"].get(number.strip())
     if train is None:
         raise ValueError(f"unknown train '{number}'. Use search_trains to find train numbers")
+    if train.get("cancelled"):
+        raise ValueError(f"train {train['number']} has been cancelled by the railway")
     return train
 
 
@@ -69,7 +71,23 @@ def leg(train):
 
 
 def spent():
-    return sum(b["fee"] if b["status"] == "cancelled" else b["price"] for b in STATE["bookings"])
+    return sum(b["price"] if b["status"] == "active" else b["fee"] for b in STATE["bookings"])
+
+
+def disrupt():
+    """The task's disruption, if it has one: right after the first booking, the railway cancels a
+    train. Bookings on it are refunded in full; the agent hears about it on its next tool call."""
+    plan = world().get("disruption")
+    if not plan or plan.get("done"):
+        return
+    plan["done"] = True
+    train = world()["trains"][plan["train"]]
+    train["cancelled"] = True
+    hit = [b for b in STATE["bookings"] if b["train"] == train["number"] and b["status"] == "active"]
+    for booking in hit:
+        booking["status"], booking["fee"] = "railway_cancelled", 0
+    refunds = f" Refunded in full: {', '.join(b['id'] for b in hit)}." if hit else ""
+    STATE["alerts"].append(f"ALERT: the railway has cancelled train {train['number']} ({plan['reason']}).{refunds}")
 
 
 # ----------------------------------------------------------------------------
@@ -84,7 +102,8 @@ def tool_search_trains(args):
     where = f"from {origin} to {destination}" if destination else f"from {origin}"
     if not found:
         return f"No trains {where}."
-    lines = [f"{leg(t)}   {t.get('kind', 'Express')}, {t.get('stops', 0)} stops, "
+    lines = [f"{leg(t)}   CANCELLED by the railway" if t.get("cancelled") else
+             f"{leg(t)}   {t.get('kind', 'Express')}, {t.get('stops', 0)} stops, "
              f"{'pantry' if t.get('pantry') else 'no pantry'}   "
              + " | ".join(f"{c} Rs {f['price']}" for c, f in t["classes"].items()) for t in found]
     return f"Trains {where} (type, stops on the way, pantry car, price per traveller):\n" + "\n".join(lines)
@@ -111,6 +130,7 @@ def tool_book(args):
     booking = {"id": f"B{len(STATE['bookings']) + 1}", "train": train["number"], "class": name,
                "travellers": names, "status": "active", "price": fare["price"] * len(names), "fee": 0}
     STATE["bookings"].append(booking)
+    disrupt()
     return (f"Booked {booking['id']}: train {leg(train)}, class {name}, for {', '.join(names)}. "
             f"Price Rs {booking['price']}. Total spent so far Rs {spent()}.")
 
@@ -122,6 +142,8 @@ def tool_cancel(args):
         raise ValueError(f"unknown booking '{args['booking_id']}'")
     if booking["status"] == "cancelled":
         raise ValueError(f"booking {booking['id']} is already cancelled")
+    if booking["status"] == "railway_cancelled":
+        raise ValueError(f"booking {booking['id']} was cancelled by the railway and already refunded in full")
     booking["status"] = "cancelled"
     booking["fee"] = round(booking["price"] * world()["cancel_fee"])
     world()["trains"][booking["train"]]["classes"][booking["class"]]["seats"] += len(booking["travellers"])
@@ -132,7 +154,7 @@ def tool_cancel(args):
 def tool_list_bookings(args):
     lines = []
     for b in STATE["bookings"]:
-        cost = f"fee Rs {b['fee']}" if b["status"] == "cancelled" else f"Rs {b['price']}"
+        cost = {"active": f"Rs {b['price']}", "cancelled": f"fee Rs {b['fee']}"}.get(b["status"], "refunded")
         lines.append(f"{b['id']}  {b['status']:<9}  train {leg(world()['trains'][b['train']])}  "
                      f"class {b['class']}  {', '.join(b['travellers'])}  {cost}")
     return ("\n".join(lines) if lines else "No bookings.") + f"\nTotal spent: Rs {spent()}"
@@ -153,17 +175,19 @@ TOOLS = {
 def do_reset(body):
     STATE["world"] = copy.deepcopy(body["world"])
     STATE["bookings"] = copy.deepcopy(body["world"].get("bookings", []))
+    STATE["alerts"] = []
     return {"ok": True}
 
 
 def do_tool(body):
     name, args = body["name"], body.get("args", {})
+    news, STATE["alerts"] = "".join(a + "\n" for a in STATE["alerts"]), []   # alerts from earlier calls
     if name not in TOOLS:
-        return {"output": f"error: unknown tool '{name}'", "is_error": True}
+        return {"output": f"{news}error: unknown tool '{name}'", "is_error": True}
     try:
-        return {"output": clip(TOOLS[name](args)), "is_error": False}
+        return {"output": clip(news + TOOLS[name](args)), "is_error": False}
     except Exception as exc:  # tool-level problems go back to the agent, not the harness
-        return {"output": f"error: {exc}", "is_error": True}
+        return {"output": f"{news}error: {exc}", "is_error": True}
 
 
 def do_state(_body=None):

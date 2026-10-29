@@ -15,22 +15,43 @@ timetable, so a number reported by the sandbox is never trusted.
 
 Booking nothing covers no one, so it scores 0. Booking everything goes far over budget, so it scores 0.
 Travellers must travel together: if they are split across trains, only the biggest group counts.
+A booking on a train the railway cancelled (the task's disruption) is refunded in full and seats no one.
+If scoring takes longer than VERIFIER_SECONDS, the score is 0: a slow verifier never pays out.
 """
+import time
 from collections import Counter
 
 MAX_LEGS = 4          # the longest trip (number of trains) the verifier looks for
 MAX_SEARCH = 20000    # search steps, so a flood of bookings can't make the verifier hang
+VERIFIER_SECONDS = 120     # wall-clock limit for scoring (the spec's 2 minutes); past it the score is 0
 OVER_BUDGET_GRACE = 0.10   # up to this share over budget halves the score; more gives 0
 NOT_BEST = 0.6             # a valid trip that isn't the cheapest / best value: partial credit, never a success
 
 
-def score_bookings(task, state):
+class VerifierTimeout(Exception):
+    pass
+
+
+def score_bookings(task, state, seconds=VERIFIER_SECONDS):
+    """Score the final bookings. Fails closed: if it takes longer than `seconds`, the score is 0."""
+    try:
+        return _score(task, state, time.monotonic() + seconds)
+    except VerifierTimeout:
+        return _result(0, 0, 0, 0, 0, task.request,
+                       [f"verifier_timeout: scoring took longer than {seconds} s, so the score is 0"])
+
+
+def _score(task, state, deadline):
     world, request = task.world, task.request
     trains, travellers = world["trains"], request["travellers"]
     notes, legs, spent, leftover = [], [], 0, 0
     seats_used = Counter()
+    disrupted = (world.get("disruption") or {}).get("train")
 
     for booking in state.get("bookings", []):
+        if disrupted is not None and booking.get("train") == disrupted:
+            notes.append(f"{booking.get('id')}: train {disrupted} was cancelled by the railway (refunded, no seat)")
+            continue
         train = trains.get(booking.get("train"))
         fare = train["classes"].get(booking.get("class")) if train else None
         names = booking.get("travellers")
@@ -67,7 +88,7 @@ def score_bookings(task, state):
     for name in travellers:
         mine = {leg["number"]: leg for leg in legs
                 if name in leg["travellers"] and leg["class"] == request["travel_class"]}
-        for trip in set(_trips(list(mine.values()), request)):
+        for trip in set(_trips(list(mine.values()), request, deadline)):
             holders.setdefault(trip, []).append(name)
     # They travel together, so only the biggest group on one shared trip counts.
     best = max(sorted(holders), key=lambda trip: len(holders[trip]), default=())
@@ -107,7 +128,7 @@ def score_bookings(task, state):
     tidy = max(0.5, 1 - 0.1 * leftover)
     best_choice = 1
     if request.get("objective") and group:
-        top = best_trip(world, request)
+        top = best_trip(world, request, deadline)
         mine = trip_cost(trains, best, request)
         if top and mine > top[1] + 0.5:
             best_choice = NOT_BEST
@@ -125,26 +146,33 @@ def trip_cost(trains, trip, request):
     return fares
 
 
-def best_trip(world, request):
-    """The best valid trip in the whole timetable: (train numbers, cost per traveller), or None.
-    Valid = every rule, enough seats for the whole group, and within budget."""
-    group, travel_class = len(request["travellers"]), request["travel_class"]
-    legs = [{**t, "class": travel_class} for t in world["trains"].values()
-            if t["classes"].get(travel_class, {"seats": 0})["seats"] >= group]
-    trips = [(trip, trip_cost(world["trains"], trip, request)) for trip in set(_trips(legs, request))]
-    trips = [(trip, cost) for trip, cost in trips
-             if sum(world["trains"][n]["classes"][travel_class]["price"] for n in trip) * group <= request["budget"]]
+def best_trip(world, request, deadline=None):
+    """The best valid trip in the whole timetable: (train numbers, cost per traveller), or None."""
+    trips = [(trip, trip_cost(world["trains"], trip, request)) for trip in valid_trips(world, request, deadline)]
     return min(trips, key=lambda tc: (tc[1], tc[0]), default=None)
 
 
-def _trips(legs, request):
-    """Every chain of these trains from the origin to the destination that keeps the rules."""
+def valid_trips(world, request, deadline=None):
+    """Every trip in the whole timetable that keeps every rule, has enough seats for the whole
+    group and fits the budget (existing bookings and fees aside)."""
+    group, travel_class = len(request["travellers"]), request["travel_class"]
+    legs = [{**t, "class": travel_class} for t in world["trains"].values()
+            if t["classes"].get(travel_class, {"seats": 0})["seats"] >= group]
+    return [trip for trip in sorted(set(_trips(legs, request, deadline)))
+            if sum(world["trains"][n]["classes"][travel_class]["price"] for n in trip) * group <= request["budget"]]
+
+
+def _trips(legs, request, deadline=None):
+    """Every chain of these trains from the origin to the destination that keeps the rules.
+    Raises VerifierTimeout once the clock passes `deadline` (a time.monotonic() value)."""
     found, steps = [], [0]
 
     def walk(here, earliest, path):
         steps[0] += 1
         if steps[0] > MAX_SEARCH:
             return
+        if deadline is not None and time.monotonic() >= deadline:
+            raise VerifierTimeout
         if here == request["destination"] and path:
             found.append(tuple(path))
             return

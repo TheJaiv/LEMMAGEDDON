@@ -18,6 +18,7 @@ SYSTEM_PROMPT = (
 )
 TRIMMED = "[older tool output removed to save context]"
 TRIMMED_ARGS = '{"note": "arguments removed to save context"}'
+EMPTY_REPLY = "(empty reply)"   # stands in for a reply with no text and no tool call
 
 
 @dataclass
@@ -143,8 +144,10 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         record["latency_ms"] = int((time.monotonic() - call_start) * 1000)
         record["model_output_raw"], record["tokens"] = reply.raw, reply.tokens
 
-        # keep every tool call in the history so each one gets a matching result
-        assistant = {"role": "assistant", "content": reply.text}
+        # keep every tool call in the history so each one gets a matching result.
+        # An empty reply gets a placeholder: some providers reject an assistant message with no content.
+        text = reply.text if reply.text and reply.text.strip() else None
+        assistant = {"role": "assistant", "content": text if text or reply.tool_calls else EMPTY_REPLY}
         if reply.tool_calls:
             assistant["tool_calls"] = [{"id": c.id, "type": "function",
                                         "function": {"name": c.name, "arguments": c.history_arguments()}}

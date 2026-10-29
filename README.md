@@ -8,9 +8,9 @@ accepts **any** valid itinerary; there is no single answer to copy.
 **Top 10 at the RL Hackathon (October 2026), the only first-year team in the top 10.**
 Team LEMMAGEDDON: Jaiv Patel, Shrey Panchal, Sahil Gupta.
 
-- 10 seeded tasks at 3 levels, each with planted trap trains that break exactly one rule
-- 0 of 42,389 attempts to get undeserved reward got through the verifier
-- GPT-Luna solved 40 of 44 runs (91%)
+- 13 seeded tasks at 3 levels, with 47 planted trap trains (33 kinds) that each break exactly one rule
+- 16 distinct attack types, tried on 200 seeds of every task: none got undeserved reward
+- GPT-Luna solved 40 of 44 runs (91%) on the first 10 tasks
 
 **Submission documents:** [design doc (2 pages, PDF)](docs/design-doc.pdf) ·
 [presentation deck (15 slides, PDF)](docs/deck.pdf)
@@ -82,6 +82,10 @@ price, fee, time and seat count from its own copy of the timetable, so numbers r
 sandbox are never trusted. Every score comes with plain-language notes, for example
 `"Shrey: on different trains from the rest of the group"`.
 
+A booking on a train the railway cancelled (`disruption_hard`) is refunded in full and seats no
+one. Scoring has its own clock: if it takes longer than 120 seconds, the score is 0, so a slow
+verifier can never pay out.
+
 ## Task set
 
 Every task is a seeded generator: each seed gives a different timetable and request, and the same
@@ -100,6 +104,13 @@ trap trains that each break exactly one rule.
 | `facilities_medium`   | medium | needs a pantry car and at most N stops: of four train types on the route, only one fits |
 | `cheapest_medium`     | medium | a direct train and a connection both fit: book the cheaper one (either can win)         |
 | `value_hard`          | hard   | both fit and time has a price (Rs per hour): book the better value (either can win)     |
+| `disruption_hard`     | hard   | after the first booking the railway cancels the obvious train: notice it and rebook     |
+| `join_group_hard`     | hard   | a third traveller joins two who hold the last seats: move all three, pay one fee        |
+| `network_hard`        | hard   | 14 stations, about 50 trains, 4 travellers: only trips with two changes work            |
+
+The last three tasks were added after the hackathon, from the judges' feedback that both live
+tasks were solved in a few steps: a disruption in the middle of the episode, a tighter group
+constraint, and a timetable about four times larger.
 
 Trains come in four types with different speed, price, stops and facilities: Rajdhani (fast,
 dear, pantry, 2–4 stops), Superfast, Express, and Passenger (slow, cheap, no pantry, 18–30 stops).
@@ -116,6 +127,9 @@ The harness never crashed on the local models' replies; every mistake got a clea
 was read from the text (tool calls written after prose or in code blocks). Local runs used a 16K
 context window: Ollama's default of 4K silently cut off the start of the conversation (the task
 itself). qwen3:8b was also tried but needs more than the 120 s allowed per reply on a laptop.
+
+The three tasks added after the hackathon have so far been run only with the mock agents and
+the tests below, not with a model.
 
 Its misses are planted traps working. Two scored partial credit (0.6): on `cheapest_medium` it booked the first direct train that fit and never looked at connections; on `value_hard` it chose the fast train when the slow connection was the better value. The other two: on `fix_connection_hard` it cancelled both
 existing bookings and ran out of budget; on `long_trip_hard` it found both shortcuts, saw they
@@ -160,13 +174,16 @@ Exit codes: `0` finished, `1` crash, `2` a baseline check failed, `3` bad config
 | Time per tool call   | 60 seconds; a timeout returns an error to the agent and the episode continues |
 | Tool output          | 4,000 characters                                                              |
 | Context              | old tool outputs trimmed to keep the conversation under about 48K tokens      |
+| Verifier             | 120 seconds; past it the score is 0                                           |
 
 Malformed replies (no tool call, invalid JSON, unknown tool, wrong argument types) get a clear
 error back and use up a step; the run continues. Replies in other providers' shapes are read too:
 arguments sent as an object, missing call ids, the older `function_call` field, content as a list
 of parts, a response without `choices`, and (only when there is no structured tool call) tool
 calls written into the text as `<tool_call>{...}</tool_call>`, a JSON code block, or a bare JSON
-object or list. Such calls are logged with `"source": "text"`.
+object or list. Such calls are logged with `"source": "text"`. A reply with no text and no tool
+call is kept in the history as `(empty reply)`, because some providers reject an empty assistant
+message in the next request.
 Termination reasons: `success`, `failure`, `step_cap`, `time_cap`, `crash`.
 
 ## Suspicious-behaviour flags
@@ -207,7 +224,7 @@ scores 0.
 
 ## Tests
 
-All three need only Python 3 (no Docker, no network) and use the real sandbox and verifier code.
+All four need only Python 3 (no Docker, no network) and use the real sandbox and verifier code.
 
 ```bash
 python3 tests/check_tasks.py 300   # every task on 300 seeds
@@ -218,12 +235,16 @@ python3 tests/check_exploits.py    # attempts to get undeserved reward
 
 - `check_tasks.py`: the same seed builds the same task; the reference solution runs without tool
   errors and scores ≥ 0.95; doing nothing scores ≤ 0.05; every planted trap scores < 0.95; every
-  train runs within one day.
+  train runs within one day; a verifier that has run out of time scores 0.
 - `check_harness.py`: through the real step loop, on 5 seeds of every task, `mock/solver` succeeds
   with no flags, `mock/idle` scores ≤ 0.05, and `mock/cheater` scores ≤ 0.05 without crashing the
-  run and raises every flag it provokes.
+  run and raises every flag it provokes. An empty reply never goes back to the model as an empty
+  message.
 - `check_parsing.py`: 18 reply shapes; the parser finds the right calls, or none, and never crashes.
-- `check_exploits.py`, on 50 seeds of every task (10 tasks, 10,591 attempts, 0 problems; 42,389 on 200 seeds):
+- `check_exploits.py`: 16 distinct attack types (10 kinds of bad booking, 5 forged sandbox states,
+  a double cancel) plus doing nothing, and 5 honest variants that must still pass, on every
+  seed of every task. On 200 seeds of the 13 tasks that is 55,589 attempts, 0 problems (the
+  same 22 patterns repeated, honest variants included):
   - 11 exploits must score below 0.95 when the sandbox accepts them: lookalike (Cyrillic) names, a
     traveller listed twice, every train booked twice, one traveller left out, an extra booking,
     the wrong class, instructions as a name, 100 travellers, made-up train numbers, half a trip,
@@ -261,8 +282,37 @@ docs/design-doc.pdf       design doc submitted to the hackathon
 docs/deck.pdf             presentation deck
 ```
 
+## Commit IDs in the submission logs
+
+On 25 October, after the logs in the submission zip were made, the commit messages in this
+repository were edited and the history rewritten. No file changed, but every commit got a new
+ID, so the logs refer to commits that no longer exist here. This table maps them (each pair has
+the same file tree):
+
+| In the logs | In this repository | Commit                                                       |
+| ----------- | ------------------ | ------------------------------------------------------------ |
+| `14e2d94`   | `9c661c4`          | Replace the template's coding tasks with a train-booking world |
+| `42dad43`   | `713ed67`          | Add four tasks, enforce travelling together                  |
+| `7511c0c`   | `52a1c47`          | Add two hard tasks and soften the budget penalty             |
+| `b79831c`   | `1d53afb`          | Rewrite the README for the train-booking environment         |
+| `6c54586`   | `181517e`          | Flag suspicious behaviour, add a cheater agent               |
+| `35d93da`   | `d70ce1d`          | Read tool calls written after prose                          |
+| `e31c044`   | `e55bcb5`          | Read code blocks with any label                              |
+| `63fc76a`   | `7ef66c9`          | Flag a valid trip that gets undone                           |
+| `2d8b576`   | `b6dd549`          | Add exploit tests                                            |
+| `3320d3f`   | `12e8104`          | Add train types and three tasks about choosing between trips |
+| `3b8a396`   | `37a2ccc`          | Update results: GPT-Luna 40 of 44 across all ten tasks       |
+| `35c632d`   | `f8505b3`          | Name the Docker Compose project after the team               |
+
+Lesson learned: never rewrite history once anything refers to it.
+
 ## How it was built
 
 Built on the hackathon template https://github.com/ayushmothiya1/RL-ENV-TEMPLATE (Docker setup,
 step loop, logging, baseline gate). The train world, tools, verifier, tasks and tests were written
 during the hackathon, mostly with AI-assisted development (Claude) under the team's direction.
+
+After the hackathon, the judges' review was acted on: three harder tasks (`disruption_hard`,
+`join_group_hard`, `network_hard`), a wall-clock limit for the verifier, a placeholder for empty
+replies, attack types counted as distinct types rather than repeated attempts, and the commit ID
+table above.
